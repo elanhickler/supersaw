@@ -6814,7 +6814,7 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
   }
 
   createHypersawVoice() {
-    return { phase: 0, randomOffset: Math.random() * 2 - 1, driftOut: 0, driftFilterState: 0 };
+    return { phase: 0, randomOffset: Math.random() * 2 - 1, driftOut: 0, driftFilterState: 0, activeGain: 0 };
   }
 
   createHypersawState() {
@@ -6822,7 +6822,7 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
     for (let i = 0; i < 64; i++) {
       voices.push(this.createHypersawVoice());
     }
-    return { voices, vibPhase: 0, nativeHandle: 0 };
+    return { voices, vibPhase: 0, countsInitialized: false, smoothedNumOscillators: 0, activeUpperBound: 0, nativeHandle: 0 };
   }
 
   destroyHypersawNativeState(state) {
@@ -6879,12 +6879,34 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
     state.vibPhase = this.hypersawWrap01(state.vibPhase + vibRate / sampleRate);
     const vibSample = this.hypersawFastSine01(state.vibPhase + 0.5);
 
-    const sawSamples = new Array(numOscillators);
-    const voicePhases = new Array(numOscillators);
+    // First-ever call: snap straight to the requested count (no unwanted
+    // fade-in delay when a sound starts) -- later CHANGES to
+    // numOscillators are smoothed instead (see hypersaw.cpp's header
+    // comment for the full rationale).
+    if (!state.countsInitialized) {
+      state.smoothedNumOscillators = numOscillators;
+      state.activeUpperBound = numOscillators;
+      for (let v = 0; v < numOscillators; v++) state.voices[v].activeGain = 1;
+      state.countsInitialized = true;
+    }
+    if (numOscillators > state.activeUpperBound) state.activeUpperBound = numOscillators;
 
-    for (let i = 0; i < numOscillators; i++) {
+    const countSmoothCoeff = 1 - Math.exp(-1 / (0.02 * sampleRate));  // ~20ms
+    state.smoothedNumOscillators += (numOscillators - state.smoothedNumOscillators) * countSmoothCoeff;
+    const smoothedCount = state.smoothedNumOscillators > 1 ? state.smoothedNumOscillators : 1;
+    const gainSmoothCoeff = 1 - Math.exp(-1 / (0.01 * sampleRate));  // ~10ms
+
+    const voicePhases = new Array(numOscillators);
+    let leftSum = 0, rightSum = 0;
+    let leftGainSum = 0, rightGainSum = 0;
+
+    for (let i = 0; i < state.activeUpperBound; i++) {
       const voice = state.voices[i];
-      const div = i / numOscillators;
+
+      const gainTarget = i < numOscillators ? 1 : 0;
+      voice.activeGain += (gainTarget - voice.activeGain) * gainSmoothCoeff;
+
+      const div = i / smoothedCount;
 
       let walkOut = 0;
       if (driftAmt > 0) {
@@ -6903,44 +6925,44 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
 
       const renderPhase = this.hypersawWrap01(voice.phase + phaseOffset + dispersion);
       // PolyBLEP::saw(): 1 - 2*t + blep(t, dt) -- a descending ramp.
-      sawSamples[i] = 1 - 2 * renderPhase + this.hypersawPolyBlep(renderPhase, phaseIncrement > 0 ? phaseIncrement : 1);
-      voicePhases[i] = this.hypersawWrap01(dispersion);
+      const sawSample = (1 - 2 * renderPhase + this.hypersawPolyBlep(renderPhase, phaseIncrement > 0 ? phaseIncrement : 1)) * voice.activeGain;
+
+      if (i < numOscillators) {
+        voicePhases[i] = this.hypersawWrap01(dispersion);
+      }
       voice.phase = this.hypersawWrap01(voice.phase + phaseIncrement);
-    }
 
-    state.lastVoicePhases = voicePhases;
-    return { sawSamples, numOscillators };
-  }
-
-  hypersawSampleJs(state, options = {}) {
-    const level = Number(options.level) || 0;
-    const { sawSamples, numOscillators } = this.hypersawAdvanceVoices(state, options);
-
-    let leftSum = 0, rightSum = 0;
-    let leftCount = 0, rightCount = 0;
-
-    for (let i = 0; i < numOscillators; i++) {
-      const sawSample = sawSamples[i];
       const isCenter = i === 0 || (i === 1 && numOscillators % 2 === 0);
       if (isCenter) {
         leftSum += sawSample;
         rightSum += sawSample;
-        leftCount++;
-        rightCount++;
+        leftGainSum += voice.activeGain;
+        rightGainSum += voice.activeGain;
       } else if (i % 2 === 0) {
         leftSum += sawSample;
-        leftCount++;
+        leftGainSum += voice.activeGain;
       } else {
         rightSum += sawSample;
-        rightCount++;
+        rightGainSum += voice.activeGain;
       }
     }
 
-    let left = leftCount > 0 ? leftSum / leftCount : 0;
-    let right = rightCount > 0 ? rightSum / rightCount : 0;
+    while (state.activeUpperBound > numOscillators && state.voices[state.activeUpperBound - 1].activeGain < 0.0005) {
+      state.activeUpperBound--;
+    }
+
+    state.lastVoicePhases = voicePhases;
+
+    let left = leftGainSum > 0.0001 ? leftSum / leftGainSum : 0;
+    let right = rightGainSum > 0.0001 ? rightSum / rightGainSum : 0;
     if (!Number.isFinite(left)) left = 0;
     if (!Number.isFinite(right)) right = 0;
+    return { left, right };
+  }
 
+  hypersawSampleJs(state, options = {}) {
+    const level = Number(options.level) || 0;
+    const { left, right } = this.hypersawAdvanceVoices(state, options);
     return { Left: this.clampValue(left, -1.5, 1.5) * level, Right: this.clampValue(right, -1.5, 1.5) * level };
   }
 

@@ -21,6 +21,13 @@
 // step accumulator, hard-clamped to [-1,1], then lowpass-filtered mixed
 // with raw white noise) -- see hypersaw.cpp's header comment for the
 // full derivation of driftStepSize/driftRandomMix/driftWhiteNoiseMix.
+//
+// numOscillators click prevention -- see hypersaw.cpp's header comment:
+// each voice has a smooth activeGain ramp (inspired by the original's
+// env_.transferState()/exponential envelope, adapted since this port has
+// no note-envelope system) instead of switching in/out instantly, and
+// div's denominator is a smoothed (not instantaneous) oscillator count
+// so already-active voices don't jump position when the total changes.
 
 const nodeGraphHypersawMaxVoices = 64;  // matches HypersawMaster::numOscillatorsMax_
 
@@ -60,6 +67,7 @@ function nodeGraphHypersawCreateVoice() {
     randomOffset: Math.random() * 2 - 1,  // matches NoiseGenerator's run(-1,1)
     driftOut: 0,
     driftFilterState: 0,
+    activeGain: 0,
   };
 }
 
@@ -68,7 +76,7 @@ function createNodeGraphHypersawState() {
   for (let i = 0; i < nodeGraphHypersawMaxVoices; i++) {
     voices.push(nodeGraphHypersawCreateVoice());
   }
-  return { voices, vibPhase: 0 };
+  return { voices, vibPhase: 0, countsInitialized: false, smoothedNumOscillators: 0, activeUpperBound: 0 };
 }
 
 // options: { frequencyHz, sampleRate, phaseOffset (0..1), numOscillators (1..64),
@@ -121,13 +129,33 @@ function nodeGraphHypersawSample(state, options = {}) {
   state.vibPhase = nodeGraphHypersawWrap01(state.vibPhase + vibRate / sampleRate);
   const vibSample = nodeGraphHypersawFastSine01(state.vibPhase + 0.5);
 
+  // First-ever call: snap straight to the requested count (no unwanted
+  // fade-in delay when a sound starts) -- later CHANGES to numOscillators
+  // are smoothed instead (see file header comment).
+  if (!state.countsInitialized) {
+    state.smoothedNumOscillators = numOscillators;
+    state.activeUpperBound = numOscillators;
+    for (let v = 0; v < numOscillators; v++) state.voices[v].activeGain = 1;
+    state.countsInitialized = true;
+  }
+  if (numOscillators > state.activeUpperBound) state.activeUpperBound = numOscillators;
+
+  const countSmoothCoeff = 1 - Math.exp(-1 / (0.02 * sampleRate));  // ~20ms
+  state.smoothedNumOscillators += (numOscillators - state.smoothedNumOscillators) * countSmoothCoeff;
+  const smoothedCount = state.smoothedNumOscillators > 1 ? state.smoothedNumOscillators : 1;
+  const gainSmoothCoeff = 1 - Math.exp(-1 / (0.01 * sampleRate));  // ~10ms
+
   let leftSum = 0, rightSum = 0;
-  let leftCount = 0, rightCount = 0;
+  let leftGainSum = 0, rightGainSum = 0;
   const voicePhases = new Array(numOscillators);
 
-  for (let i = 0; i < numOscillators; i++) {
+  for (let i = 0; i < state.activeUpperBound; i++) {
     const voice = state.voices[i];
-    const div = i / numOscillators;
+
+    const gainTarget = i < numOscillators ? 1 : 0;
+    voice.activeGain += (gainTarget - voice.activeGain) * gainSmoothCoeff;
+
+    const div = i / smoothedCount;
 
     let walkOut = 0;
     if (driftAmt > 0) {
@@ -148,28 +176,34 @@ function nodeGraphHypersawSample(state, options = {}) {
 
     const renderPhase = nodeGraphHypersawWrap01(voice.phase + phaseOffset + dispersion);
     // PolyBLEP::saw(): 1 - 2*t + blep(t, dt) -- a descending ramp.
-    const sawSample = 1 - 2 * renderPhase + nodeGraphHypersawPolyBlep(renderPhase, phaseIncrement > 0 ? phaseIncrement : 1);
+    const sawSample = (1 - 2 * renderPhase + nodeGraphHypersawPolyBlep(renderPhase, phaseIncrement > 0 ? phaseIncrement : 1)) * voice.activeGain;
 
-    voicePhases[i] = nodeGraphHypersawWrap01(dispersion);
+    if (i < numOscillators) {
+      voicePhases[i] = nodeGraphHypersawWrap01(dispersion);
+    }
     voice.phase = nodeGraphHypersawWrap01(voice.phase + phaseIncrement);
 
     const isCenter = i === 0 || (i === 1 && numOscillators % 2 === 0);
     if (isCenter) {
       leftSum += sawSample;
       rightSum += sawSample;
-      leftCount++;
-      rightCount++;
+      leftGainSum += voice.activeGain;
+      rightGainSum += voice.activeGain;
     } else if (i % 2 === 0) {
       leftSum += sawSample;
-      leftCount++;
+      leftGainSum += voice.activeGain;
     } else {
       rightSum += sawSample;
-      rightCount++;
+      rightGainSum += voice.activeGain;
     }
   }
 
-  let left = leftCount > 0 ? leftSum / leftCount : 0;
-  let right = rightCount > 0 ? rightSum / rightCount : 0;
+  while (state.activeUpperBound > numOscillators && state.voices[state.activeUpperBound - 1].activeGain < 0.0005) {
+    state.activeUpperBound--;
+  }
+
+  let left = leftGainSum > 0.0001 ? leftSum / leftGainSum : 0;
+  let right = rightGainSum > 0.0001 ? rightSum / rightGainSum : 0;
   if (!Number.isFinite(left)) left = 0;
   if (!Number.isFinite(right)) right = 0;
 
