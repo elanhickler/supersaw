@@ -346,7 +346,6 @@ if (!(Test-Path -LiteralPath $clang)) {
   "-Wl,--export=soemdsp_hypersaw_sample" `
   "-Wl,--export=soemdsp_hypersaw_left" `
   "-Wl,--export=soemdsp_hypersaw_right" `
-  "-Wl,--export=soemdsp_hypersaw_voice_phase" `
   "-Wl,--export=soemdsp_hypersaw_max_voices" `
   "-Wl,--export=soemdsp_hypersaw_version" `
   "-Wl,--export-memory" `

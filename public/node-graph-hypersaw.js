@@ -1,23 +1,21 @@
-// Shared offline JS mirror of native_modules/hypersaw -- Hypersaw, a bank
-// of up to 32 bandlimited (PolyBLEP) sawtooth voices spread across the
-// phase cycle. See native_modules/hypersaw/hypersaw.cpp for the full
-// derivation and the mapping back to soundemote's own HypersawUnit/
-// HypersawMaster (docs/reference/Hypersaw.hpp).
+// Shared offline JS mirror of native_modules/hypersaw -- see that file's
+// header comment for the full derivation. Every parameter name here
+// matches native_modules/hypersaw/hypersaw.cpp exactly, which in turn
+// matches soundemote's own HypersawUnit::run() (docs/reference/
+// Hypersaw.hpp):
 //
-// Each voice keeps its own phase accumulator at the shared base
-// frequency. The accumulator's rendered phase is displaced by three
-// independent, additive dispersion sources:
-//   spread  -- scales the voice's fixed even position i/numVoices.
-//   random  -- scales a fixed random offset drawn once per voice.
-//   drift   -- scales a slow, continuously wandering reflecting random
-//              walk per-voice offset.
-// Center voices (voice 0, and voice 1 if numVoices is even) sum into
-// both channels; the rest alternate Left/Right. Each channel is averaged
-// (not summed) by its own contributor count so voice count doesn't
-// change overall loudness -- same convention as this sandbox's
-// RobinSupersaw module.
+//   div               = i / numOscillators
+//   staticDispersion  = div * distributePhaseAmp + randomOffset * randomPhaseAmp
+//   vibratoMultiplier = vibInputForVoice * vibAmp + vibOffset   (vibInput only for voice i >= 1)
+//   walkOut           = driftAmp > 0 ? driftLp * driftAmp : 0
+//   dispersion        = staticDispersion * vibratoMultiplier + walkOut
+//
+// vibOffset=0 fully silences distributePhaseAmp/randomPhaseAmp regardless
+// of their own values -- that's the original's actual (multiplicative,
+// not additive) formula, not a bug.
 
-const nodeGraphHypersawMaxVoices = 32;
+const nodeGraphHypersawMaxVoices = 64;  // matches HypersawMaster::numOscillatorsMax_
+const nodeGraphHypersawDriftFixedStepSize = 0.12;
 
 function nodeGraphHypersawPolyBlep(t, dt) {
   if (dt <= 0) return 0;
@@ -37,11 +35,19 @@ function nodeGraphHypersawWrap01(x) {
   return w < 0 ? 0 : (w >= 1 ? 0 : w);
 }
 
+// Cheap, smooth, periodic parabolic approximation of sin(2*pi*phase01) --
+// good enough for a sub-audio vibrato LFO.
+function nodeGraphHypersawFastSine01(phase01) {
+  const x = nodeGraphHypersawWrap01(phase01) - 0.5;
+  return 8 * x * (0.5 - Math.abs(x));
+}
+
 function nodeGraphHypersawCreateVoice() {
   return {
     phase: 0,
     randomOffset: Math.random() - 0.5,
     driftLp: 0,
+    driftStepTimer: 0,
   };
 }
 
@@ -50,61 +56,76 @@ function createNodeGraphHypersawState() {
   for (let i = 0; i < nodeGraphHypersawMaxVoices; i++) {
     voices.push(nodeGraphHypersawCreateVoice());
   }
-  return { voices };
+  return { voices, vibPhase: 0 };
 }
 
-// options: { frequencyHz, sampleRate, phaseOffset (0..1), numVoices (1..32),
-//   spread (0..1), randomAmount (0..1), driftAmount (0..1), level }
+// options: { frequencyHz, sampleRate, phaseOffset (0..1), numOscillators (1..64),
+//   distributePhaseAmp (0..1), randomPhaseAmp (0..1), driftAmp (0..1),
+//   driftFrequency (Hz), driftJitter (0..1), vibAmp (0..2), vibOffset,
+//   vibRate (Hz), level }
 // returns: { Left, Right, voicePhases: number[] } -- voicePhases is each
-// active voice's dispersion offset (0..1, wrapped), in order, for the
-// voice-position display. Deliberately excludes the audio-rate phase
-// accumulator (that's the pitch itself, sweeping every cycle), so all 3
-// dispersion controls at 0 means every voice sits at the same still
-// point instead of racing across the display at the oscillator's
-// frequency.
+// active voice's dispersion offset (0..1, wrapped), for the voice-position
+// display. Excludes the audio-rate phase accumulator (that's the pitch
+// itself), so all dispersion controls at their silencing values means
+// every voice sits still.
 function nodeGraphHypersawSample(state, options = {}) {
   const sampleRate = Number(options.sampleRate) > 1 ? Number(options.sampleRate) : 48000;
   const safeFrequency = Number(options.frequencyHz) > 0 ? Number(options.frequencyHz) : 0;
   const phaseOffset = nodeGraphHypersawWrap01(Number(options.phaseOffset) || 0);
-  const numVoices = clampNodeSliderValue(Math.round(Number(options.numVoices) || 1), 1, nodeGraphHypersawMaxVoices);
-  const spreadAmt = clampNodeSliderValue(Number(options.spread) || 0, 0, 1);
-  const randomAmt = clampNodeSliderValue(Number(options.randomAmount) || 0, 0, 1);
-  const driftAmt = clampNodeSliderValue(Number(options.driftAmount) || 0, 0, 1);
+  const numOscillators = clampNodeSliderValue(Math.round(Number(options.numOscillators) || 1), 1, nodeGraphHypersawMaxVoices);
+  const distributeAmt = clampNodeSliderValue(Number(options.distributePhaseAmp) || 0, 0, 1);
+  const randomAmt = clampNodeSliderValue(Number(options.randomPhaseAmp) || 0, 0, 1);
+  const driftAmt = clampNodeSliderValue(Number(options.driftAmp) || 0, 0, 1);
+  const driftJitterAmt = clampNodeSliderValue(Number(options.driftJitter) || 0, 0, 1);
+  const safeDriftFrequency = Number(options.driftFrequency) > 0.01 ? Number(options.driftFrequency) : 0.01;
+  const vibAmt = clampNodeSliderValue(Number(options.vibAmp) || 0, 0, 2);
+  const vibOffsetAmt = Number(options.vibOffset) || 0;
+  const vibRate = Number(options.vibRate) || 0;
   const level = Number(options.level) || 0;
 
-  // Drift is a genuine reflecting random walk, NOT a lowpass filter over
-  // fresh-every-sample white noise (that was tried first and is a bug --
-  // filtering a brand-new random value each sample suppresses its
-  // variance to near-nothing at any audio-rate-appropriate coefficient).
-  // stepScale is normalized by 1/sqrt(sampleRate) so the walk's diffusive
-  // growth reaches a given wander range in the same wall-clock time
-  // regardless of sample rate; reflecting at +/-0.5 keeps it bounded
-  // while still continuously wandering.
-  const driftStepScale = 0.2 / Math.sqrt(sampleRate);
   const phaseIncrement = safeFrequency / sampleRate;
+
+  // vibOsc_ -- one shared oscillator per Hypersaw instance, matching
+  // `vibOsc_.phaseOffset_ = 0.5` at construction.
+  state.vibPhase = nodeGraphHypersawWrap01(state.vibPhase + vibRate / sampleRate);
+  const vibSample = nodeGraphHypersawFastSine01(state.vibPhase + 0.5);
 
   let leftSum = 0, rightSum = 0;
   let leftCount = 0, rightCount = 0;
-  const voicePhases = new Array(numVoices);
+  const voicePhases = new Array(numOscillators);
 
-  for (let i = 0; i < numVoices; i++) {
+  for (let i = 0; i < numOscillators; i++) {
     const voice = state.voices[i];
-    const basePosition = i / numVoices;
-    voice.driftLp += (Math.random() * 2 - 1) * driftStepScale;
-    if (voice.driftLp > 0.5) voice.driftLp = 1 - voice.driftLp;
-    if (voice.driftLp < -0.5) voice.driftLp = -1 - voice.driftLp;
+    const div = i / numOscillators;
 
-    const dispersion = basePosition * spreadAmt + voice.randomOffset * randomAmt + voice.driftLp * driftAmt;
+    // drift_ (FlexibleRandomWalk, Method::fixed_steps): fixed-magnitude,
+    // random-sign steps at ~driftFrequency Hz, jittered timing.
+    voice.driftStepTimer -= 1;
+    if (voice.driftStepTimer <= 0) {
+      const jitterFactor = 1 + (Math.random() * 2 - 1) * 2 * driftJitterAmt;
+      let nominalInterval = (sampleRate / safeDriftFrequency) * jitterFactor;
+      if (nominalInterval < 1) nominalInterval = 1;
+      voice.driftStepTimer = nominalInterval;
+      voice.driftLp += (Math.random() * 2 - 1) * 2 * nodeGraphHypersawDriftFixedStepSize;
+      if (voice.driftLp > 0.5) voice.driftLp = 1 - voice.driftLp;
+      if (voice.driftLp < -0.5) voice.driftLp = -1 - voice.driftLp;
+    }
+
+    // vibInput_ only ever points at vibOsc_ for i >= 1.
+    const vibInputForVoice = i === 0 ? 0 : vibSample;
+
+    const staticDispersion = div * distributeAmt + voice.randomOffset * randomAmt;
+    const vibratoMultiplier = vibInputForVoice * vibAmt + vibOffsetAmt;
+    const walkOut = driftAmt > 0 ? voice.driftLp * driftAmt : 0;
+    const dispersion = staticDispersion * vibratoMultiplier + walkOut;
+
     const renderPhase = nodeGraphHypersawWrap01(voice.phase + phaseOffset + dispersion);
     const sawSample = 2 * renderPhase - 1 - nodeGraphHypersawPolyBlep(renderPhase, phaseIncrement > 0 ? phaseIncrement : 1);
 
-    // Display position is dispersion only -- voice.phase runs at the
-    // fundamental frequency (that's the pitch itself, not something a
-    // "voice position" display should show), so it's excluded here.
     voicePhases[i] = nodeGraphHypersawWrap01(dispersion);
     voice.phase = nodeGraphHypersawWrap01(voice.phase + phaseIncrement);
 
-    const isCenter = i === 0 || (i === 1 && numVoices % 2 === 0);
+    const isCenter = i === 0 || (i === 1 && numOscillators % 2 === 0);
     if (isCenter) {
       leftSum += sawSample;
       rightSum += sawSample;

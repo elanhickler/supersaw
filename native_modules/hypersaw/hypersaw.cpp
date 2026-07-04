@@ -4,40 +4,68 @@
 // soemdsp-native-kind: oscillator
 
 // Hypersaw -- a bank of up to kMaxVoices bandlimited (PolyBLEP) sawtooth
-// oscillators, each voice spread across the 0..1 phase cycle. A faithful,
-// simplified proof-of-concept port of soundemote's own HypersawUnit/
-// HypersawMaster (see docs/reference/Hypersaw.hpp): each voice keeps its
-// own phase accumulator at the same base frequency; the accumulator's
-// rendered phase is then displaced by three independent, additive
-// dispersion sources (transcribed from HypersawUnit::run()'s
-// `div_ * distributePhaseAmp_` / `randomPhaseOffset_ * randomPhaseAmp_` /
-// walkOut_ terms):
+// oscillators, each voice spread across the 0..1 phase cycle. A faithful
+// port of soundemote's own HypersawUnit::run() dispersion formula (see
+// docs/reference/Hypersaw.hpp) -- every parameter here is named after,
+// and behaves like, the corresponding member in that header:
 //
-//   spread  -- each voice i has a fixed base position i/numVoices (the
-//              original's `div_`); "spread" scales how much of that even
-//              distribution is actually applied to the phase.
-//   random  -- each voice draws one fixed random offset at creation/reset
-//              (the original's `randomPhaseOffset_`); "random" scales it.
-//   drift   -- each voice's offset also continuously wanders via a
-//              reflecting random walk (the original's `drift_`/
-//              `walkOut_` FlexibleRandomWalk); "drift" scales it.
+//   HypersawUnit::run():
+//     double phase = (div_ * distributePhaseAmp_)
+//                  + (div_ * vibratoOut_)                 // always 0 -- see below
+//                  + (randomPhaseOffset_ * randomPhaseAmp_);
+//     osc_.phaseOffset_ = phase * ((vibInput_ * vibAmp_) + vibOffset_) + walkOut_;
+//     walkOut_ = driftAmp_ > 0 ? drift_.run() * driftAmp_ : 0;
 //
-// Vibrato (the original's fourth dispersion source, driven by a shared
-// oscillator) is intentionally omitted to keep this proof-of-concept to 3
-// dispersion controls, per this module's design brief.
+// Transcribed here as (per voice i of numOscillators):
+//   div                = i / numOscillators                    (fixed per-voice position)
+//   randomPhaseOffset  = a fixed per-voice random value in [-0.5, 0.5],
+//                        drawn at creation and re-drawn on reset (matches
+//                        HypersawUnit::randomizePhase(), called from
+//                        HypersawMaster::oscResetRanged() on note trigger)
+//   staticDispersion   = div * distributePhaseAmp + randomPhaseOffset * randomPhaseAmp
+//   vibratoMultiplier  = vibInput * vibAmp + vibOffset
+//   walkOut            = driftAmp > 0 ? drift * driftAmp : 0
+//   dispersion         = staticDispersion * vibratoMultiplier + walkOut
 //
-// Output is stereo: voice 0 (and voice 1, if numVoices is even) are
-// treated as "center" voices and summed into both channels, matching the
-// original HypersawMaster::run()'s center/side split; the remaining
-// voices alternate Left/Right. Each channel is averaged (not summed) by
-// its own contributor count -- same loudness-normalizing convention as
-// this sandbox's RobinSupersaw module -- so voice count doesn't change
-// overall loudness.
+// Notes on fidelity:
+// - `vibratoOut_` in the original is computed by a line that is commented
+//   out in HypersawUnit::run() (`// vibratoOut_ = vibInput_ * vibAmp_ +
+//   vibOffset_;`), so it is always 0 in the real, running behavior of the
+//   original -- omitted here to match that actual (not intended) behavior.
+// - `vibInput_` points at a single shared HypersawMaster::vibOsc_ for
+//   every voice from index 1 upward (`for (int i = 1; i < oscArray_.size();
+//   ++i) oscArray_[i].vibInput_.pointTo(&vibOsc_.out_);`) -- voice 0 never
+//   receives it, matching `vibInputForVoice` below.
+// - `vibOsc_` itself (a shared PolyBLEP oscillator, `phaseOffset_ = 0.5`
+//   at construction) has no exposed rate control in Hypersaw.hpp -- its
+//   frequency is presumably wired up elsewhere in soundemote's larger
+//   codebase. `vibRate` here is this port's own addition to make the
+//   vibrato musically usable; every other parameter name below matches
+//   the original exactly.
+// - `drift_` is a `modulator::FlexibleRandomWalk` set to
+//   `Method::fixed_steps` at construction, with `driftFrequency_`/
+//   `driftJitterChanged()` controlling its rate and timing jitter.
+//   FlexibleRandomWalk.hpp isn't available in this repo, so its exact
+//   internals are approximated here as: fixed-magnitude, random-sign
+//   steps (matching "fixed_steps"), taken at an average rate of
+//   driftFrequency Hz, with driftJitter randomizing the interval between
+//   steps (0 = perfectly regular, 1 = highly irregular timing).
+// - `numOscillators` matches `HypersawMaster::numOscillators_`
+//   (`numOscillatorsMax_` = 64, matched by kMaxVoices below).
+//
+// Output is stereo: voice 0 (and voice 1, if numOscillators is even) are
+// "center" voices summed into both channels, matching HypersawMaster::
+// run()'s center/side split; the rest alternate Left/Right. Each channel
+// is averaged (not summed) by its own contributor count -- same
+// loudness-normalizing convention as this sandbox's RobinSupersaw module
+// -- so voice count doesn't change overall loudness. (HypersawMaster's
+// own centerSideCrossfade_/velocity_/envelope/portamento system is out
+// of scope here -- this port covers the phase-dispersion circuit only.)
 
 namespace {
 
 constexpr int kMaxInstances = 8;
-constexpr int kMaxVoices = 32;
+constexpr int kMaxVoices = 64;  // matches HypersawMaster::numOscillatorsMax_
 
 double clampD(double value, double lo, double hi) {
   return value < lo ? lo : (value > hi ? hi : value);
@@ -77,29 +105,49 @@ double polyBlep(double t, double dt) {
   return 0.0;
 }
 
+// Cheap, smooth, periodic parabolic approximation of sin(2*pi*phase01) --
+// good enough for a sub-audio vibrato LFO (vibOsc_'s own waveform isn't
+// specified in Hypersaw.hpp, so exact spectral fidelity isn't the point).
+double fastSine01(double phase01) {
+  double x = wrap01(phase01) - 0.5;  // -0.5..0.5
+  return 8.0 * x * (0.5 - (x < 0.0 ? -x : x));
+}
+
 struct HypersawVoiceState {
-  double phase;        // main running accumulator, 0..1
-  double randomOffset;  // fixed per-voice random offset in [-0.5, 0.5], set at seed/reset
-  double driftLp;       // reflecting random walk value, the continuously wandering drift value
+  double phase;           // main running accumulator, 0..1 (osc_'s own phase)
+  double randomOffset;    // randomPhaseOffset_: fixed per-voice random value, set at seed/reset
+  double driftLp;         // drift_'s current value (the walk's running position)
+  double driftStepTimer;  // samples remaining until drift_'s next fixed-size step
   unsigned int rngState;
 };
 
 struct HypersawState {
   bool active;
   HypersawVoiceState voices[kMaxVoices];
+  double vibPhase;  // vibOsc_'s shared running phase accumulator, 0..1
   double outLeft;
   double outRight;
 };
 
 static HypersawState gPool[kMaxInstances];
 
+// The original's FlexibleRandomWalk "fixed_steps" method takes constant-
+// magnitude steps; this is that fixed magnitude (an implementation
+// constant, since the original's own default isn't available).
+constexpr double kDriftFixedStepSize = 0.12;
+
+void resetVoice(HypersawVoiceState& voice) {
+  voice.phase = 0.0;
+  voice.randomOffset = randomBipolarUnit(voice.rngState);
+  voice.driftLp = 0.0;
+  voice.driftStepTimer = 0.0;
+}
+
 void seedVoice(HypersawVoiceState& voice, int instanceIndex, int voiceIndex) {
   voice.rngState = static_cast<unsigned int>(
     2166136261u + (instanceIndex + 1) * 16777619u + (voiceIndex + 1) * 2654435761u
   );
-  voice.phase = 0.0;
-  voice.randomOffset = randomBipolarUnit(voice.rngState);
-  voice.driftLp = 0.0;
+  resetVoice(voice);
 }
 
 }  // namespace
@@ -123,33 +171,57 @@ extern "C" void soemdsp_hypersaw_destroy(int handle) {
   gPool[handle - 1].active = false;
 }
 
+// Note-trigger reset -- matches HypersawMaster::oscResetRanged() (called
+// from oscReset()): resets each voice's phase, redraws randomPhaseOffset_
+// (randomizePhase()), and zeroes drift_'s state, plus resets the shared
+// vibOsc_ phase.
 extern "C" void soemdsp_hypersaw_reset(int handle) {
   if (handle < 1 || handle > kMaxInstances) return;
   HypersawState& s = gPool[handle - 1];
   for (int v = 0; v < kMaxVoices; v++) {
-    s.voices[v].phase = 0.0;
-    s.voices[v].randomOffset = randomBipolarUnit(s.voices[v].rngState);
-    s.voices[v].driftLp = 0.0;
+    resetVoice(s.voices[v]);
   }
+  s.vibPhase = 0.0;
 }
 
 // frequencyHz: the shared fundamental for every voice.
-// phaseOffset: global phase control (0..1), added to every voice alike.
-// numVoices: 1..kMaxVoices sawtooths in the bank.
-// spread: 0..1, scales each voice's fixed even phase position (i/numVoices).
-// randomAmount: 0..1, scales each voice's fixed random phase offset.
-// driftAmount: 0..1, scales each voice's slow, continuously wandering
-//   phase offset (a reflecting random walk).
+// phaseOffset: global phase control (0..1), added to every voice alike
+//   (this port's own addition, matching every other oscillator module in
+//   this sandbox -- not part of Hypersaw.hpp).
+// numOscillators: 1..kMaxVoices sawtooths in the bank (numOscillators_).
+// distributePhaseAmp: 0..1, scales each voice's fixed even phase position
+//   (div_ = i/numOscillators) (distributePhaseAmp_).
+// randomPhaseAmp: 0..1, scales each voice's fixed random phase offset
+//   (randomPhaseAmp_).
+// driftAmp: 0..1, scales each voice's random-walk phase offset (driftAmp_).
+// driftFrequency: Hz, the average rate at which drift_ takes a new fixed-
+//   size step (driftFrequency_).
+// driftJitter: 0..1, randomizes the interval between drift steps
+//   (driftJitterChanged()'s underlying value).
+// vibAmp: 0..1, how much the shared vibrato oscillator scales the static
+//   (distribute+random) dispersion (vibAmp_).
+// vibOffset: the constant term added alongside vibAmp*vibInput in that
+//   same scaling factor (vibOffset_) -- with vibAmp=0, this alone
+//   determines how much of the static dispersion passes through (1.0 =
+//   fully passes through, 0.0 = fully silences it, exactly per the
+//   original formula).
+// vibRate: Hz, the shared vibrato oscillator's rate (this port's own
+//   addition -- see file header comment).
 // level: output gain.
 extern "C" void soemdsp_hypersaw_sample(
   int handle,
   double frequencyHz,
   double sampleRate,
   double phaseOffset,
-  int numVoices,
-  double spread,
-  double randomAmount,
-  double driftAmount,
+  int numOscillators,
+  double distributePhaseAmp,
+  double randomPhaseAmp,
+  double driftAmp,
+  double driftFrequency,
+  double driftJitter,
+  double vibAmp,
+  double vibOffset,
+  double vibRate,
   double level
 ) {
   if (handle < 1 || handle > kMaxInstances) return;
@@ -157,26 +229,21 @@ extern "C" void soemdsp_hypersaw_sample(
 
   const double safeSampleRate = sampleRate > 1.0 ? sampleRate : 48000.0;
   const double safeFrequency = frequencyHz > 0.0 ? frequencyHz : 0.0;
-  const int voiceCount = numVoices < 1 ? 1 : (numVoices > kMaxVoices ? kMaxVoices : numVoices);
-  const double spreadAmt = clampD(spread, 0.0, 1.0);
-  const double randomAmt = clampD(randomAmount, 0.0, 1.0);
-  const double driftAmt = clampD(driftAmount, 0.0, 1.0);
-
-  // Drift is a genuine reflecting random walk (NOT a lowpass filter over
-  // fresh-every-sample white noise -- that was tried first and is a bug:
-  // filtering a brand-new random value each sample with any audio-rate-
-  // appropriate one-pole coefficient suppresses its variance by a factor
-  // on the order of the coefficient itself, which is ~1e-5 at typical
-  // sample rates -- the result is visually/audibly flat, not "drifting").
-  // Each voice takes an independent small random step every sample;
-  // stepScale is normalized by 1/sqrt(sampleRate) so a random walk's
-  // diffusive growth (RMS distance grows as step * sqrt(sampleCount))
-  // reaches a given wander range in the same wall-clock time regardless
-  // of sample rate. Reflecting at +/-0.5 keeps it bounded while still
-  // continuously wandering forever, and per-voice values are already
-  // decorrelated since each voice draws its own random step.
-  const double driftStepScale = 0.2 / __builtin_sqrt(safeSampleRate);
+  const int voiceCount = numOscillators < 1 ? 1 : (numOscillators > kMaxVoices ? kMaxVoices : numOscillators);
+  const double distributeAmt = clampD(distributePhaseAmp, 0.0, 1.0);
+  const double randomAmt = clampD(randomPhaseAmp, 0.0, 1.0);
+  const double driftAmt = clampD(driftAmp, 0.0, 1.0);
+  const double driftJitterAmt = clampD(driftJitter, 0.0, 1.0);
+  const double safeDriftFrequency = driftFrequency > 0.01 ? driftFrequency : 0.01;
+  const double vibAmt = clampD(vibAmp, 0.0, 2.0);
+  const double vibOffsetAmt = vibOffset;
   const double phaseIncrement = safeFrequency / safeSampleRate;
+
+  // vibOsc_ -- one shared oscillator per Hypersaw instance (not per
+  // voice), matching `vibOsc_.phaseOffset_ = 0.5` at construction (a
+  // fixed half-cycle offset baked into the render below).
+  s.vibPhase = wrap01(s.vibPhase + vibRate / safeSampleRate);
+  const double vibSample = fastSine01(s.vibPhase + 0.5);
 
   double leftSum = 0.0, rightSum = 0.0;
   int leftCount = 0, rightCount = 0;
@@ -184,13 +251,29 @@ extern "C" void soemdsp_hypersaw_sample(
   for (int i = 0; i < voiceCount; i++) {
     HypersawVoiceState& voice = s.voices[i];
 
-    const double basePosition = static_cast<double>(i) / static_cast<double>(voiceCount);
-    voice.driftLp += randomBipolarUnit(voice.rngState) * 2.0 * driftStepScale;
-    if (voice.driftLp > 0.5) voice.driftLp = 1.0 - voice.driftLp;
-    if (voice.driftLp < -0.5) voice.driftLp = -1.0 - voice.driftLp;
+    const double div = static_cast<double>(i) / static_cast<double>(voiceCount);
 
-    const double dispersion =
-      basePosition * spreadAmt + voice.randomOffset * randomAmt + voice.driftLp * driftAmt;
+    // drift_ (FlexibleRandomWalk, Method::fixed_steps): fixed-magnitude,
+    // random-sign steps at ~driftFrequency Hz, jittered timing.
+    voice.driftStepTimer -= 1.0;
+    if (voice.driftStepTimer <= 0.0) {
+      const double jitterFactor = 1.0 + randomBipolarUnit(voice.rngState) * 2.0 * driftJitterAmt;
+      double nominalInterval = (safeSampleRate / safeDriftFrequency) * jitterFactor;
+      if (nominalInterval < 1.0) nominalInterval = 1.0;
+      voice.driftStepTimer = nominalInterval;
+      voice.driftLp += randomBipolarUnit(voice.rngState) * 2.0 * kDriftFixedStepSize;
+      if (voice.driftLp > 0.5) voice.driftLp = 1.0 - voice.driftLp;
+      if (voice.driftLp < -0.5) voice.driftLp = -1.0 - voice.driftLp;
+    }
+
+    // vibInput_ only ever points at vibOsc_ for i >= 1 (see file header).
+    const double vibInputForVoice = (i == 0) ? 0.0 : vibSample;
+
+    const double staticDispersion = div * distributeAmt + voice.randomOffset * randomAmt;
+    const double vibratoMultiplier = vibInputForVoice * vibAmt + vibOffsetAmt;
+    const double walkOut = driftAmt > 0.0 ? voice.driftLp * driftAmt : 0.0;
+    const double dispersion = staticDispersion * vibratoMultiplier + walkOut;
+
     const double renderPhase = wrap01(voice.phase + phaseOffset + dispersion);
     const double sawSample = 2.0 * renderPhase - 1.0 - polyBlep(renderPhase, phaseIncrement > 0.0 ? phaseIncrement : 1.0);
 
@@ -231,19 +314,10 @@ extern "C" double soemdsp_hypersaw_right(int handle) {
   return gPool[handle - 1].outRight;
 }
 
-// Returns voiceIndex's rendered phase (0..1, post-dispersion) as of the
-// most recent sample() call -- used to drive the "vertical line per
-// voice" phosphor display.
-extern "C" double soemdsp_hypersaw_voice_phase(int handle, int voiceIndex) {
-  if (handle < 1 || handle > kMaxInstances) return 0.0;
-  if (voiceIndex < 0 || voiceIndex >= kMaxVoices) return 0.0;
-  return gPool[handle - 1].voices[voiceIndex].phase;
-}
-
 extern "C" int soemdsp_hypersaw_max_voices() {
   return kMaxVoices;
 }
 
 extern "C" int soemdsp_hypersaw_version() {
-  return 1;
+  return 2;
 }

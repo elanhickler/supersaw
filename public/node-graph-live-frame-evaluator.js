@@ -3013,6 +3013,30 @@ function evaluateNodeGraphPlanFrame(runtime, sampleRate, frame, frames) {
     } else if (node?.type === "hypersaw") {
       const state = runtime.hypersawStates.get(nodeId) || createNodeGraphHypersawState();
       runtime.hypersawStates.set(nodeId, state);
+      // Reset input -- matches HypersawMaster::oscReset() (a note trigger
+      // in the original): redraws each voice's randomOffset
+      // (randomizePhase()), zeroes phase and drift, and resets the
+      // shared vibOsc_ phase.
+      const resetState = runtime.oscResetStates.get(nodeId) || createNodeGraphOscResetState();
+      runtime.oscResetStates.set(nodeId, resetState);
+      const resetValue = nodeGraphSafeFilterNumber(
+        mixInput(nodeId, "Reset"),
+        runtime,
+        nodeId,
+        resetState,
+        "hypersaw reset",
+      );
+      const resetEdge = resetState.lastReset <= 0 && resetValue > 0;
+      resetState.lastReset = resetValue;
+      if (resetEdge) {
+        for (const voice of state.voices) {
+          voice.phase = 0;
+          voice.randomOffset = Math.random() - 0.5;
+          voice.driftLp = 0;
+          voice.driftStepTimer = 0;
+        }
+        state.vibPhase = 0;
+      }
       const read = (key, fallback) => readNodeGraphLiveEffectiveParam(runtime, node, key, fallback, frame, frames, frameValues);
       // baseFrequency is the pitch heard at the global pitch reference note
       // (see node-graph-patch-normalizers.js) -- same convention as
@@ -3034,10 +3058,15 @@ function evaluateNodeGraphPlanFrame(runtime, sampleRate, frame, frames) {
         frequencyHz: pitchedFrequency,
         sampleRate,
         phaseOffset: read("phase", 0),
-        numVoices: read("voices", 8),
-        spread: read("spread", 1),
-        randomAmount: read("random", 0.15),
-        driftAmount: read("drift", 0.1),
+        numOscillators: read("numOscillators", 8),
+        distributePhaseAmp: read("distributePhaseAmp", 1),
+        randomPhaseAmp: read("randomPhaseAmp", 0.15),
+        driftAmp: read("driftAmp", 0.1),
+        driftFrequency: read("driftFrequency", 2),
+        driftJitter: read("driftJitter", 0.3),
+        vibAmp: read("vibAmp", 0),
+        vibOffset: read("vibOffset", 1),
+        vibRate: read("vibRate", 5),
         level: read("level", 0.35),
       });
       value = { Left: hypersawResult.Left, Right: hypersawResult.Right };

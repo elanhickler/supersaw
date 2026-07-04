@@ -812,13 +812,25 @@ const nodeGraphModuleDefinitions = Object.freeze({
     ],
     inputs: ["Reset", "0.1V/Oct"],
     outputs: ["Left", "Right"],
+    // Parameter names below match soundemote's own HypersawUnit/
+    // HypersawMaster (docs/reference/Hypersaw.hpp) exactly -- see
+    // native_modules/hypersaw/hypersaw.cpp's header comment for the full
+    // formula each one plugs into. "frequency", "phase", and "level" are
+    // this port's own additions (matching every other oscillator module
+    // in this sandbox), as is "vibRate" (the original exposes vibAmp_/
+    // vibOffset_ but not vibOsc_'s own rate).
     parameters: [
-      { key: "voices", label: "Num Sawtooths", defaultValue: "8", min: "1", mid: "8", max: "32", step: "1" },
+      { key: "numOscillators", label: "Num Oscillators", defaultValue: "8", min: "1", mid: "8", max: "64", step: "1" },
       { key: "phase", label: "Phase", kind: "phase", defaultValue: "0", min: "0", mid: "0.5", max: "1", step: "0.01", unit: "cycle", wraparound: true },
       { key: "frequency", label: "Frequency", kind: "frequency", defaultValue: "100", min: "0", mid: "220", max: "20000", step: "any", unit: "Hz" },
-      { key: "spread", label: "Spread", defaultValue: "1", min: "0", mid: "0.5", max: "1", step: "0.01" },
-      { key: "random", label: "Random", defaultValue: "0.15", min: "0", mid: "0.5", max: "1", step: "0.01" },
-      { key: "drift", label: "Drift", defaultValue: "0.1", min: "0", mid: "0.5", max: "1", step: "0.01" },
+      { key: "distributePhaseAmp", label: "Distribute Phase Amp", defaultValue: "1", min: "0", mid: "0.5", max: "1", step: "0.01" },
+      { key: "randomPhaseAmp", label: "Random Phase Amp", defaultValue: "0.15", min: "0", mid: "0.5", max: "1", step: "0.01" },
+      { key: "driftAmp", label: "Drift Amp", defaultValue: "0.1", min: "0", mid: "0.5", max: "1", step: "0.01" },
+      { key: "driftFrequency", label: "Drift Frequency", kind: "frequency", defaultValue: "2", min: "0.01", mid: "2", max: "20", step: "any", unit: "Hz" },
+      { key: "driftJitter", label: "Drift Jitter", defaultValue: "0.3", min: "0", mid: "0.5", max: "1", step: "0.01" },
+      { key: "vibAmp", label: "Vib Amp", defaultValue: "0", min: "0", mid: "0.5", max: "2", step: "0.01" },
+      { key: "vibOffset", label: "Vib Offset", defaultValue: "1", min: "0", mid: "1", max: "2", step: "0.01" },
+      { key: "vibRate", label: "Vib Rate", kind: "frequency", defaultValue: "5", min: "0.01", mid: "5", max: "20", step: "any", unit: "Hz" },
       { key: "level", label: "Amplitude", defaultValue: "0.35", min: "0", mid: "0.5", max: "1", step: "0.01" },
     ],
   },

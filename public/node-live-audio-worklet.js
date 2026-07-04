@@ -6777,10 +6777,10 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
   }
 
   // Hypersaw -- see native_modules/hypersaw/hypersaw.cpp for the full
-  // derivation (a proof-of-concept port of soundemote's own
-  // HypersawUnit/HypersawMaster, docs/reference/Hypersaw.hpp). Fully
-  // self-contained JS fallback for the same isolated-worklet-scope reason
-  // as RobinSupersaw above -- never calls the shared
+  // derivation and the exact mapping back to soundemote's own
+  // HypersawUnit::run() (docs/reference/Hypersaw.hpp). Fully self-
+  // contained JS fallback for the same isolated-worklet-scope reason as
+  // RobinSupersaw above -- never calls the shared
   // public/node-graph-hypersaw.js globals, which this worklet's isolated
   // scope never loads.
 
@@ -6802,16 +6802,22 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
     return w < 0 ? 0 : (w >= 1 ? 0 : w);
   }
 
+  // Cheap, smooth, periodic parabolic approximation of sin(2*pi*phase01).
+  hypersawFastSine01(phase01) {
+    const x = this.hypersawWrap01(phase01) - 0.5;
+    return 8 * x * (0.5 - Math.abs(x));
+  }
+
   createHypersawVoice() {
-    return { phase: 0, randomOffset: Math.random() - 0.5, driftLp: 0 };
+    return { phase: 0, randomOffset: Math.random() - 0.5, driftLp: 0, driftStepTimer: 0 };
   }
 
   createHypersawState() {
     const voices = [];
-    for (let i = 0; i < 32; i++) {
+    for (let i = 0; i < 64; i++) {
       voices.push(this.createHypersawVoice());
     }
-    return { voices, nativeHandle: 0 };
+    return { voices, vibPhase: 0, nativeHandle: 0 };
   }
 
   destroyHypersawNativeState(state) {
@@ -6821,10 +6827,10 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
     }
   }
 
-  // Advances each voice's phase accumulator + drift/dispersion exactly
-  // once per sample() call and returns the per-voice sawtooth samples
-  // plus the post-dispersion renderPhase array (used to drive the
-  // phosphor-burn display). Factored out of hypersawSampleJs so the
+  // Advances the shared vibOsc_ + each voice's phase accumulator and
+  // drift/dispersion exactly once per sample() call, returning the
+  // per-voice sawtooth samples plus the dispersion array (used to drive
+  // the voice-position display). Factored out of hypersawSampleJs so the
   // native-audio path below can call it too (advancing this JS shadow
   // state purely for the display, in parallel with native's own opaque
   // internal state) without duplicating -- and thereby double-stepping --
@@ -6833,56 +6839,65 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
     const sampleRate = Number(options.sampleRate) > 1 ? Number(options.sampleRate) : 48000;
     const safeFrequency = Number(options.frequencyHz) > 0 ? Number(options.frequencyHz) : 0;
     const phaseOffset = this.hypersawWrap01(Number(options.phaseOffset) || 0);
-    const numVoices = this.clampValue(Math.round(Number(options.numVoices) || 1), 1, 32);
-    const spreadAmt = this.clampValue(Number(options.spread) || 0, 0, 1);
-    const randomAmt = this.clampValue(Number(options.randomAmount) || 0, 0, 1);
-    const driftAmt = this.clampValue(Number(options.driftAmount) || 0, 0, 1);
+    const numOscillators = this.clampValue(Math.round(Number(options.numOscillators) || 1), 1, 64);
+    const distributeAmt = this.clampValue(Number(options.distributePhaseAmp) || 0, 0, 1);
+    const randomAmt = this.clampValue(Number(options.randomPhaseAmp) || 0, 0, 1);
+    const driftAmt = this.clampValue(Number(options.driftAmp) || 0, 0, 1);
+    const driftJitterAmt = this.clampValue(Number(options.driftJitter) || 0, 0, 1);
+    const safeDriftFrequency = Number(options.driftFrequency) > 0.01 ? Number(options.driftFrequency) : 0.01;
+    const vibAmt = this.clampValue(Number(options.vibAmp) || 0, 0, 2);
+    const vibOffsetAmt = Number(options.vibOffset) || 0;
+    const vibRate = Number(options.vibRate) || 0;
 
-    // Drift is a genuine reflecting random walk, NOT a lowpass filter over
-    // fresh-every-sample white noise (that was tried first and is a bug --
-    // filtering a brand-new random value each sample suppresses its
-    // variance to near-nothing at any audio-rate-appropriate coefficient).
-    // stepScale is normalized by 1/sqrt(sampleRate) so the walk's
-    // diffusive growth reaches a given wander range in the same wall-
-    // clock time regardless of sample rate; reflecting at +/-0.5 keeps it
-    // bounded while still continuously wandering.
-    const driftStepScale = 0.2 / Math.sqrt(sampleRate);
     const phaseIncrement = safeFrequency / sampleRate;
 
-    const sawSamples = new Array(numVoices);
-    const voicePhases = new Array(numVoices);
+    state.vibPhase = this.hypersawWrap01(state.vibPhase + vibRate / sampleRate);
+    const vibSample = this.hypersawFastSine01(state.vibPhase + 0.5);
 
-    for (let i = 0; i < numVoices; i++) {
+    const sawSamples = new Array(numOscillators);
+    const voicePhases = new Array(numOscillators);
+
+    for (let i = 0; i < numOscillators; i++) {
       const voice = state.voices[i];
-      const basePosition = i / numVoices;
-      voice.driftLp += (Math.random() * 2 - 1) * driftStepScale;
-      if (voice.driftLp > 0.5) voice.driftLp = 1 - voice.driftLp;
-      if (voice.driftLp < -0.5) voice.driftLp = -1 - voice.driftLp;
+      const div = i / numOscillators;
 
-      const dispersion = basePosition * spreadAmt + voice.randomOffset * randomAmt + voice.driftLp * driftAmt;
+      voice.driftStepTimer -= 1;
+      if (voice.driftStepTimer <= 0) {
+        const jitterFactor = 1 + (Math.random() * 2 - 1) * 2 * driftJitterAmt;
+        let nominalInterval = (sampleRate / safeDriftFrequency) * jitterFactor;
+        if (nominalInterval < 1) nominalInterval = 1;
+        voice.driftStepTimer = nominalInterval;
+        voice.driftLp += (Math.random() * 2 - 1) * 2 * 0.12;
+        if (voice.driftLp > 0.5) voice.driftLp = 1 - voice.driftLp;
+        if (voice.driftLp < -0.5) voice.driftLp = -1 - voice.driftLp;
+      }
+
+      const vibInputForVoice = i === 0 ? 0 : vibSample;
+      const staticDispersion = div * distributeAmt + voice.randomOffset * randomAmt;
+      const vibratoMultiplier = vibInputForVoice * vibAmt + vibOffsetAmt;
+      const walkOut = driftAmt > 0 ? voice.driftLp * driftAmt : 0;
+      const dispersion = staticDispersion * vibratoMultiplier + walkOut;
+
       const renderPhase = this.hypersawWrap01(voice.phase + phaseOffset + dispersion);
       sawSamples[i] = 2 * renderPhase - 1 - this.hypersawPolyBlep(renderPhase, phaseIncrement > 0 ? phaseIncrement : 1);
-      // Display position is dispersion only -- voice.phase runs at the
-      // fundamental frequency (the pitch itself), not something a "voice
-      // position" display should show.
       voicePhases[i] = this.hypersawWrap01(dispersion);
       voice.phase = this.hypersawWrap01(voice.phase + phaseIncrement);
     }
 
     state.lastVoicePhases = voicePhases;
-    return { sawSamples, numVoices };
+    return { sawSamples, numOscillators };
   }
 
   hypersawSampleJs(state, options = {}) {
     const level = Number(options.level) || 0;
-    const { sawSamples, numVoices } = this.hypersawAdvanceVoices(state, options);
+    const { sawSamples, numOscillators } = this.hypersawAdvanceVoices(state, options);
 
     let leftSum = 0, rightSum = 0;
     let leftCount = 0, rightCount = 0;
 
-    for (let i = 0; i < numVoices; i++) {
+    for (let i = 0; i < numOscillators; i++) {
       const sawSample = sawSamples[i];
-      const isCenter = i === 0 || (i === 1 && numVoices % 2 === 0);
+      const isCenter = i === 0 || (i === 1 && numOscillators % 2 === 0);
       if (isCenter) {
         leftSum += sawSample;
         rightSum += sawSample;
@@ -6919,25 +6934,35 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
           const sampleRate = Number(options.sampleRate) > 1 ? Number(options.sampleRate) : 48000;
           const frequencyHz = Number(options.frequencyHz) || 0;
           const phaseOffset = Number(options.phaseOffset) || 0;
-          const numVoices = Math.round(Number(options.numVoices) || 1);
-          const spread = Number(options.spread) || 0;
-          const randomAmount = Number(options.randomAmount) || 0;
-          const driftAmount = Number(options.driftAmount) || 0;
+          const numOscillators = Math.round(Number(options.numOscillators) || 1);
+          const distributePhaseAmp = Number(options.distributePhaseAmp) || 0;
+          const randomPhaseAmp = Number(options.randomPhaseAmp) || 0;
+          const driftAmp = Number(options.driftAmp) || 0;
+          const driftFrequency = Number(options.driftFrequency) || 0;
+          const driftJitter = Number(options.driftJitter) || 0;
+          const vibAmp = Number(options.vibAmp) || 0;
+          const vibOffset = Number(options.vibOffset) || 0;
+          const vibRate = Number(options.vibRate) || 0;
           const level = Number(options.level) || 0;
           this.nativeHypersaw.soemdsp_hypersaw_sample(
             state.nativeHandle,
             frequencyHz,
             sampleRate,
             phaseOffset,
-            numVoices,
-            spread,
-            randomAmount,
-            driftAmount,
+            numOscillators,
+            distributePhaseAmp,
+            randomPhaseAmp,
+            driftAmp,
+            driftFrequency,
+            driftJitter,
+            vibAmp,
+            vibOffset,
+            vibRate,
             level,
           );
           // Native owns the real audio-critical voice state opaquely (no
           // access from JS). Advance this JS-side shadow bank purely so
-          // the phosphor-burn display has phase data to draw -- visually
+          // the voice-position display has data to draw -- visually
           // representative of the dispersion in effect, though not
           // sample-exact with native's own internal RNG stream.
           this.hypersawAdvanceVoices(state, options);
@@ -7807,6 +7832,27 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
       } else if (node?.type === "hypersaw") {
         const state = this.hypersawStates.get(nodeId) || this.createHypersawState();
         this.hypersawStates.set(nodeId, state);
+        // Reset input -- matches HypersawMaster::oscReset() (a note
+        // trigger in the original): redraws each voice's randomOffset
+        // (randomizePhase()), zeroes phase and drift, and resets the
+        // shared vibOsc_ phase.
+        const resetState = this.oscResetStates.get(nodeId) || this.createOscResetState();
+        this.oscResetStates.set(nodeId, resetState);
+        const resetValue = this.safeFilterNumber(mixInput(nodeId, "Reset"), resetState);
+        const resetEdge = resetState.lastReset <= 0 && resetValue > 0;
+        resetState.lastReset = resetValue;
+        if (resetEdge) {
+          for (const voice of state.voices) {
+            voice.phase = 0;
+            voice.randomOffset = Math.random() - 0.5;
+            voice.driftLp = 0;
+            voice.driftStepTimer = 0;
+          }
+          state.vibPhase = 0;
+          if (state.nativeHandle && this.nativeHypersaw?.soemdsp_hypersaw_reset) {
+            this.nativeHypersaw.soemdsp_hypersaw_reset(state.nativeHandle);
+          }
+        }
         const read = (key, fallback) => this.readEffectiveParameter(node, key, fallback, frame, frames, frameValues);
         // baseFrequency is the pitch heard at the global pitch reference
         // note -- same convention as RobinSupersaw above.
@@ -7822,10 +7868,15 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
           frequencyHz: pitchedFrequency,
           sampleRate: this.engineSampleRate || sampleRate,
           phaseOffset: read("phase", 0),
-          numVoices: read("voices", 8),
-          spread: read("spread", 1),
-          randomAmount: read("random", 0.15),
-          driftAmount: read("drift", 0.1),
+          numOscillators: read("numOscillators", 8),
+          distributePhaseAmp: read("distributePhaseAmp", 1),
+          randomPhaseAmp: read("randomPhaseAmp", 0.15),
+          driftAmp: read("driftAmp", 0.1),
+          driftFrequency: read("driftFrequency", 2),
+          driftJitter: read("driftJitter", 0.3),
+          vibAmp: read("vibAmp", 0),
+          vibOffset: read("vibOffset", 1),
+          vibRate: read("vibRate", 5),
           level: read("level", 0.35),
         });
       } else if (node?.type === "midiOut") {
