@@ -18,9 +18,9 @@
 //              distribution is actually applied to the phase.
 //   random  -- each voice draws one fixed random offset at creation/reset
 //              (the original's `randomPhaseOffset_`); "random" scales it.
-//   drift   -- each voice's offset also continuously wanders via a slow
-//              one-pole-lowpassed noise source (the original's
-//              `drift_`/`walkOut_` FlexibleRandomWalk); "drift" scales it.
+//   drift   -- each voice's offset also continuously wanders via a
+//              reflecting random walk (the original's `drift_`/
+//              `walkOut_` FlexibleRandomWalk); "drift" scales it.
 //
 // Vibrato (the original's fourth dispersion source, driven by a shared
 // oscillator) is intentionally omitted to keep this proof-of-concept to 3
@@ -63,14 +63,6 @@ double randomBipolarUnit(unsigned int& state) {
   return static_cast<double>(xorshift32(state) >> 8) * (1.0 / 16777216.0) - 0.5;
 }
 
-// exp(x) via Taylor series -- freestanding WASM has no libm exp(). Only
-// ever called here with x = -2*pi*0.35/sampleRate, a tiny negative
-// number (order 1e-5 at typical sample rates), so a short series is
-// accurate to well beyond double precision's useful range for this use.
-double expSmall(double x) {
-  return 1.0 + x * (1.0 + x * (0.5 + x * (1.0 / 6.0 + x * (1.0 / 24.0 + x * (1.0 / 120.0)))));
-}
-
 // Standard PolyBLEP correction term for a naive sawtooth's discontinuity.
 double polyBlep(double t, double dt) {
   if (dt <= 0.0) return 0.0;
@@ -88,7 +80,7 @@ double polyBlep(double t, double dt) {
 struct HypersawVoiceState {
   double phase;        // main running accumulator, 0..1
   double randomOffset;  // fixed per-voice random offset in [-0.5, 0.5], set at seed/reset
-  double driftLp;       // one-pole-lowpassed noise, the continuously wandering drift value
+  double driftLp;       // reflecting random walk value, the continuously wandering drift value
   unsigned int rngState;
 };
 
@@ -147,7 +139,7 @@ extern "C" void soemdsp_hypersaw_reset(int handle) {
 // spread: 0..1, scales each voice's fixed even phase position (i/numVoices).
 // randomAmount: 0..1, scales each voice's fixed random phase offset.
 // driftAmount: 0..1, scales each voice's slow, continuously wandering
-//   phase offset (a one-pole-lowpassed noise source, ~0.35Hz corner).
+//   phase offset (a reflecting random walk).
 // level: output gain.
 extern "C" void soemdsp_hypersaw_sample(
   int handle,
@@ -170,9 +162,20 @@ extern "C" void soemdsp_hypersaw_sample(
   const double randomAmt = clampD(randomAmount, 0.0, 1.0);
   const double driftAmt = clampD(driftAmount, 0.0, 1.0);
 
-  // One-pole lowpass coefficient for a ~0.35Hz corner -- slow enough that
-  // the drift reads as a gentle, continuous wander rather than audible FM.
-  const double driftCoeff = 1.0 - expSmall(-2.0 * 3.14159265358979323846 * 0.35 / safeSampleRate);
+  // Drift is a genuine reflecting random walk (NOT a lowpass filter over
+  // fresh-every-sample white noise -- that was tried first and is a bug:
+  // filtering a brand-new random value each sample with any audio-rate-
+  // appropriate one-pole coefficient suppresses its variance by a factor
+  // on the order of the coefficient itself, which is ~1e-5 at typical
+  // sample rates -- the result is visually/audibly flat, not "drifting").
+  // Each voice takes an independent small random step every sample;
+  // stepScale is normalized by 1/sqrt(sampleRate) so a random walk's
+  // diffusive growth (RMS distance grows as step * sqrt(sampleCount))
+  // reaches a given wander range in the same wall-clock time regardless
+  // of sample rate. Reflecting at +/-0.5 keeps it bounded while still
+  // continuously wandering forever, and per-voice values are already
+  // decorrelated since each voice draws its own random step.
+  const double driftStepScale = 0.2 / __builtin_sqrt(safeSampleRate);
   const double phaseIncrement = safeFrequency / safeSampleRate;
 
   double leftSum = 0.0, rightSum = 0.0;
@@ -182,8 +185,9 @@ extern "C" void soemdsp_hypersaw_sample(
     HypersawVoiceState& voice = s.voices[i];
 
     const double basePosition = static_cast<double>(i) / static_cast<double>(voiceCount);
-    const double noiseSample = randomBipolarUnit(voice.rngState);
-    voice.driftLp += (noiseSample - voice.driftLp) * driftCoeff;
+    voice.driftLp += randomBipolarUnit(voice.rngState) * 2.0 * driftStepScale;
+    if (voice.driftLp > 0.5) voice.driftLp = 1.0 - voice.driftLp;
+    if (voice.driftLp < -0.5) voice.driftLp = -1.0 - voice.driftLp;
 
     const double dispersion =
       basePosition * spreadAmt + voice.randomOffset * randomAmt + voice.driftLp * driftAmt;

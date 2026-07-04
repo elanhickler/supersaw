@@ -6838,7 +6838,15 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
     const randomAmt = this.clampValue(Number(options.randomAmount) || 0, 0, 1);
     const driftAmt = this.clampValue(Number(options.driftAmount) || 0, 0, 1);
 
-    const driftCoeff = 1 - Math.exp((-2 * Math.PI * 0.35) / sampleRate);
+    // Drift is a genuine reflecting random walk, NOT a lowpass filter over
+    // fresh-every-sample white noise (that was tried first and is a bug --
+    // filtering a brand-new random value each sample suppresses its
+    // variance to near-nothing at any audio-rate-appropriate coefficient).
+    // stepScale is normalized by 1/sqrt(sampleRate) so the walk's
+    // diffusive growth reaches a given wander range in the same wall-
+    // clock time regardless of sample rate; reflecting at +/-0.5 keeps it
+    // bounded while still continuously wandering.
+    const driftStepScale = 0.2 / Math.sqrt(sampleRate);
     const phaseIncrement = safeFrequency / sampleRate;
 
     const sawSamples = new Array(numVoices);
@@ -6847,8 +6855,9 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
     for (let i = 0; i < numVoices; i++) {
       const voice = state.voices[i];
       const basePosition = i / numVoices;
-      const noiseSample = Math.random() - 0.5;
-      voice.driftLp += (noiseSample - voice.driftLp) * driftCoeff;
+      voice.driftLp += (Math.random() * 2 - 1) * driftStepScale;
+      if (voice.driftLp > 0.5) voice.driftLp = 1 - voice.driftLp;
+      if (voice.driftLp < -0.5) voice.driftLp = -1 - voice.driftLp;
 
       const dispersion = basePosition * spreadAmt + voice.randomOffset * randomAmt + voice.driftLp * driftAmt;
       const renderPhase = this.hypersawWrap01(voice.phase + phaseOffset + dispersion);

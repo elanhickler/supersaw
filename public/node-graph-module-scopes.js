@@ -9872,10 +9872,11 @@ function drawNodeGraphHypersawBurnItem(renderer, item, pixelRatio) {
   if (!sync.synced) {
     return;
   }
-  const square = nodeGraphScope2dBurnCanvasSquare(canvas);
-  if (!square) {
-    return;
-  }
+  // Unlike scope2d's X/Y displays, this is a 1D phase spread, not a plot
+  // with matched axes -- use the full canvas rect (not a centered square,
+  // which would only use min(width, height) and waste most of the width
+  // on a typically wide, short node scope window).
+  const rect = { height: canvas.height, left: 0, top: 0, width: canvas.width };
   const phases = nodeGraphModuleScopeState.hypersawVoicePhases?.get(String(nodeId));
   const points = [];
   if (Array.isArray(phases)) {
@@ -9884,9 +9885,9 @@ function drawNodeGraphHypersawBurnItem(renderer, item, pixelRatio) {
       if (!Number.isFinite(p)) {
         continue;
       }
-      const x = square.left + clampNodeSliderValue(p, 0, 1) * square.width;
-      points.push({ x, y: square.top });
-      points.push({ x, y: square.top + square.height });
+      const x = rect.left + clampNodeSliderValue(p, 0, 1) * rect.width;
+      points.push({ x, y: rect.top });
+      points.push({ x, y: rect.top + rect.height });
       points.push(null);
     }
   }
