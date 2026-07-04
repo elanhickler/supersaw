@@ -55,9 +55,13 @@ function createNodeGraphHypersawState() {
 
 // options: { frequencyHz, sampleRate, phaseOffset (0..1), numVoices (1..32),
 //   spread (0..1), randomAmount (0..1), driftAmount (0..1), level }
-// returns: { Left, Right, voicePhases: number[] } -- voicePhases is the
-// post-dispersion rendered phase (0..1) of each active voice, in order,
-// for driving the phosphor-burn display.
+// returns: { Left, Right, voicePhases: number[] } -- voicePhases is each
+// active voice's dispersion offset (0..1, wrapped), in order, for the
+// voice-position display. Deliberately excludes the audio-rate phase
+// accumulator (that's the pitch itself, sweeping every cycle), so all 3
+// dispersion controls at 0 means every voice sits at the same still
+// point instead of racing across the display at the oscillator's
+// frequency.
 function nodeGraphHypersawSample(state, options = {}) {
   const sampleRate = Number(options.sampleRate) > 1 ? Number(options.sampleRate) : 48000;
   const safeFrequency = Number(options.frequencyHz) > 0 ? Number(options.frequencyHz) : 0;
@@ -94,7 +98,10 @@ function nodeGraphHypersawSample(state, options = {}) {
     const renderPhase = nodeGraphHypersawWrap01(voice.phase + phaseOffset + dispersion);
     const sawSample = 2 * renderPhase - 1 - nodeGraphHypersawPolyBlep(renderPhase, phaseIncrement > 0 ? phaseIncrement : 1);
 
-    voicePhases[i] = renderPhase;
+    // Display position is dispersion only -- voice.phase runs at the
+    // fundamental frequency (that's the pitch itself, not something a
+    // "voice position" display should show), so it's excluded here.
+    voicePhases[i] = nodeGraphHypersawWrap01(dispersion);
     voice.phase = nodeGraphHypersawWrap01(voice.phase + phaseIncrement);
 
     const isCenter = i === 0 || (i === 1 && numVoices % 2 === 0);

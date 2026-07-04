@@ -6862,7 +6862,10 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
       const dispersion = basePosition * spreadAmt + voice.randomOffset * randomAmt + voice.driftLp * driftAmt;
       const renderPhase = this.hypersawWrap01(voice.phase + phaseOffset + dispersion);
       sawSamples[i] = 2 * renderPhase - 1 - this.hypersawPolyBlep(renderPhase, phaseIncrement > 0 ? phaseIncrement : 1);
-      voicePhases[i] = renderPhase;
+      // Display position is dispersion only -- voice.phase runs at the
+      // fundamental frequency (the pitch itself), not something a "voice
+      // position" display should show.
+      voicePhases[i] = this.hypersawWrap01(dispersion);
       voice.phase = this.hypersawWrap01(voice.phase + phaseIncrement);
     }
 

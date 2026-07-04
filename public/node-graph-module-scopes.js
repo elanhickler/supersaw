@@ -9845,53 +9845,50 @@ function drawNodeGraphLineBurnOscilloscopeItem(renderer, item, pixelRatio) {
   );
 }
 
-// Draws one vertical phosphor-burn line per Hypersaw voice, at x = that
-// voice's current rendered phase (0..1) mapped across the display's
-// width. Reuses the exact same WebGL additive-burn + decay pipeline as
-// lineBurn (drawNodeGraphRetainedBurnPath), just fed a different shape of
-// points: a top/bottom pair per voice (a vertical segment) separated by a
-// `null` path-break so voices don't connect diagonally to each other.
+// Draws one vertical line per Hypersaw voice, at x = that voice's current
+// phase (0..1) mapped straight across the canvas width. Deliberately a
+// fresh, self-contained 2D-canvas renderer -- no WebGL burn pipeline, no
+// dot1/dot2 settings (those belong to lineBurn's oscilloscope-trace
+// concept, which doesn't apply here: this is a snapshot of N voice
+// positions, not a swept time-domain signal). Phosphor persistence is
+// done the simple way: paint a translucent black rect over the previous
+// frame instead of clearing it, so old lines fade rather than vanish.
 // Voice phase snapshots come from nodeGraphModuleScopeState.hypersawVoicePhases,
-// populated directly by the frame evaluator's "hypersaw" dispatch case
-// (node-graph-live-frame-evaluator.js) each time it renders that node --
-// independent of the lineBurn buffer/capture pipeline, since that
-// pipeline only carries single scalar values per port, not a voice array.
+// populated by the frame evaluator's and worklet's "hypersaw" dispatch.
 function drawNodeGraphHypersawBurnItem(renderer, item, pixelRatio) {
-  const node = nodeGraphModuleScopeNodeForSlot(item?.slot);
   const nodeId = item?.slot?.nodeId;
-  if (!node || !nodeId) {
+  if (!nodeId) {
     return;
   }
-  const settings = nodeGraphLineBurnSettingsForNode(node);
-  const canvas = nodeGraphScope2dBurnCanvasForSlot(item?.slot);
-  if (!canvas) {
-    return;
-  }
+  const canvas = nodeGraphModuleScopeLocalFallbackCanvas(item?.slot);
   const screenElement = item?.screenElement || item?.slot?.scopeElement;
-  const sync = syncNodeGraphScope2dBurnCanvas(canvas, screenElement, pixelRatio);
-  if (!sync.synced) {
+  if (!canvas || !syncNodeGraphModuleScopeLocalFallbackCanvas(canvas, screenElement, pixelRatio)) {
     return;
   }
-  // Unlike scope2d's X/Y displays, this is a 1D phase spread, not a plot
-  // with matched axes -- use the full canvas rect (not a centered square,
-  // which would only use min(width, height) and waste most of the width
-  // on a typically wide, short node scope window).
-  const rect = { height: canvas.height, left: 0, top: 0, width: canvas.width };
-  const phases = nodeGraphModuleScopeState.hypersawVoicePhases?.get(String(nodeId));
-  const points = [];
-  if (Array.isArray(phases)) {
-    for (const phase of phases) {
-      const p = Number(phase);
-      if (!Number.isFinite(p)) {
-        continue;
-      }
-      const x = rect.left + clampNodeSliderValue(p, 0, 1) * rect.width;
-      points.push({ x, y: rect.top });
-      points.push({ x, y: rect.top + rect.height });
-      points.push(null);
-    }
+  const ctx = canvas.getContext("2d");
+  if (!ctx) {
+    return;
   }
-  drawNodeGraphRetainedBurnPath(item, pixelRatio, points, settings);
+  ctx.fillStyle = "rgba(0, 0, 0, 0.2)";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  const phases = nodeGraphModuleScopeState.hypersawVoicePhases?.get(String(nodeId));
+  if (!Array.isArray(phases) || !phases.length) {
+    return;
+  }
+  ctx.strokeStyle = "#3de0ff";
+  ctx.lineWidth = Math.max(1, canvas.width / 160);
+  for (const phase of phases) {
+    const p = Number(phase);
+    if (!Number.isFinite(p)) {
+      continue;
+    }
+    const x = clampNodeSliderValue(p, 0, 1) * canvas.width;
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, canvas.height);
+    ctx.stroke();
+  }
 }
 
 function nodeGraphScope2dFiniteSample(value) {
