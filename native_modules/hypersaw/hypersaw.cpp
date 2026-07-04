@@ -6,8 +6,12 @@
 // Hypersaw -- a bank of up to kMaxVoices bandlimited (PolyBLEP) sawtooth
 // oscillators, each voice spread across the 0..1 phase cycle. A faithful
 // port of soundemote's own HypersawUnit::run() dispersion formula (see
-// docs/reference/Hypersaw.hpp) -- every parameter here is named after,
-// and behaves like, the corresponding member in that header:
+// docs/reference/Hypersaw.hpp), cross-checked against the real
+// soemdsp library headers it depends on (found at
+// C:\Users\argit\Documents\_PROGRAMMING\soemdsp\include\soemdsp\...):
+// Wire.hpp, SampleRate.hpp, random/FlexibleRandomWalk.hpp,
+// filter/OnePoleFilter.hpp, random/NoiseGenerator.hpp,
+// utility/curve_functions.hpp, oscillator/PolyBLEP.hpp.
 //
 //   HypersawUnit::run():
 //     double phase = (div_ * distributePhaseAmp_)
@@ -17,41 +21,64 @@
 //     walkOut_ = driftAmp_ > 0 ? drift_.run() * driftAmp_ : 0;
 //
 // Transcribed here as (per voice i of numOscillators):
-//   div                = i / numOscillators                    (fixed per-voice position)
-//   randomPhaseOffset  = a fixed per-voice random value in [-0.5, 0.5],
-//                        drawn at creation and re-drawn on reset (matches
-//                        HypersawUnit::randomizePhase(), called from
-//                        HypersawMaster::oscResetRanged() on note trigger)
+//   div                = i / numOscillators
+//   randomPhaseOffset  = a fixed per-voice random value in [-1, 1] (matches
+//                        randomizePhase(): `bipolarNoiseGen_.runBipolar()`,
+//                        confirmed uniform on [-1,1] in NoiseGenerator.hpp)
 //   staticDispersion   = div * distributePhaseAmp + randomPhaseOffset * randomPhaseAmp
-//   vibratoMultiplier  = vibInput * vibAmp + vibOffset
+//   vibratoMultiplier  = vibInputForVoice * vibAmp + vibOffset
 //   walkOut            = driftAmp > 0 ? drift * driftAmp : 0
 //   dispersion         = staticDispersion * vibratoMultiplier + walkOut
 //
 // Notes on fidelity:
-// - `vibratoOut_` in the original is computed by a line that is commented
-//   out in HypersawUnit::run() (`// vibratoOut_ = vibInput_ * vibAmp_ +
-//   vibOffset_;`), so it is always 0 in the real, running behavior of the
-//   original -- omitted here to match that actual (not intended) behavior.
+// - `vibratoOut_` is computed by a line that is commented out in the real
+//   HypersawUnit::run(), so it is always 0 in the original's actual
+//   (not intended) running behavior -- omitted here to match.
 // - `vibInput_` points at a single shared HypersawMaster::vibOsc_ for
-//   every voice from index 1 upward (`for (int i = 1; i < oscArray_.size();
-//   ++i) oscArray_[i].vibInput_.pointTo(&vibOsc_.out_);`) -- voice 0 never
-//   receives it, matching `vibInputForVoice` below.
-// - `vibOsc_` itself (a shared PolyBLEP oscillator, `phaseOffset_ = 0.5`
-//   at construction) has no exposed rate control in Hypersaw.hpp -- its
-//   frequency is presumably wired up elsewhere in soundemote's larger
-//   codebase. `vibRate` here is this port's own addition to make the
-//   vibrato musically usable; every other parameter name below matches
+//   every voice from index 1 upward -- voice 0 never receives it.
+// - `vibOsc_` (a shared PolyBLEP oscillator) has no exposed rate control
+//   in Hypersaw.hpp itself -- `vibRate` here is this port's own addition
+//   to make the vibrato musically usable; every other name below matches
 //   the original exactly.
-// - `drift_` is a `modulator::FlexibleRandomWalk` set to
-//   `Method::fixed_steps` at construction, with `driftFrequency_`/
-//   `driftJitterChanged()` controlling its rate and timing jitter.
-//   FlexibleRandomWalk.hpp isn't available in this repo, so its exact
-//   internals are approximated here as: fixed-magnitude, random-sign
-//   steps (matching "fixed_steps"), taken at an average rate of
-//   driftFrequency Hz, with driftJitter randomizing the interval between
-//   steps (0 = perfectly regular, 1 = highly irregular timing).
-// - `numOscillators` matches `HypersawMaster::numOscillators_`
-//   (`numOscillatorsMax_` = 64, matched by kMaxVoices below).
+//
+// drift_ (FlexibleRandomWalk, Method::fixed_steps) -- transcribed exactly
+// from FlexibleRandomWalk.hpp's run()/updateIncrement()/
+// whiteNoiseMixChanged(), one HypersawUnit per voice but with driftAmp/
+// driftFrequency/driftJitter-derived coefficients SHARED across all
+// voices (HypersawMaster::slave()s every voice's drift_ to voice 0's,
+// pointing stepSize_/randomMix_/whiteNoiseMix_/the filter's coefficients
+// all at voice 0 -- only each voice's own random draws and per-voice
+// walk/filter *state* stay independent, which is what decorrelates them):
+//   jitterInc  = driftJitter / sampleRate
+//   stepSize   = rational(0.99, jitterInc)          -- see rational() below;
+//                algebraically, updateIncrement()'s "stepSize_ = increment_;
+//                stepSize_.w += map0to1(rational(0.99, jitterInc), -stepSize_,
+//                1-stepSize_)" simplifies to exactly this (the increment_
+//                term cancels out completely)
+//   increment  = driftFrequency / sampleRate
+//   avg        = (jitterInc + increment) * 0.5
+//   whiteNoiseMix = avg >= 0.9 ? rational(-0.7, (avg-0.9)/0.1) : 0
+//   randomMix  = 1 - whiteNoiseMix
+//   lpf a1     = exp(-2*pi*driftFrequency/sampleRate), b0 = 1 - a1
+// Per voice, per sample (only while driftAmp > 0 -- drift_.run() is only
+// ever called under that same guard in the original):
+//   n   = uniform(-1, 1)
+//   r   = n > 0 ? stepSize : -stepSize
+//   out = clamp(out + r, -1, 1)                      -- NOT reflected, hard clamped
+//   filterState = b0*(out*randomMix + n*whiteNoiseMix) + a1*filterState
+//   drift = filterState
+//
+// Earlier revisions of this file guessed a "lowpass a fresh random value
+// every sample" or "sample-and-hold with jitter timing" model for drift_
+// without having these headers -- neither matches the above, which is
+// why drift didn't behave like the real Hypersaw. This revision is a
+// direct transcription, not a guess.
+//
+// PolyBLEP::saw() (the real waveform osc_ renders, Shape::Saw) is
+// `1 - 2*t + blep(t, dt)` -- a *descending* ramp. This port's sawtooth
+// generation was previously the polarity-inverted `2*t - 1 - blep(t, dt)`;
+// fixed to match exactly (audibly identical alone, but now phase-correct
+// when summed/compared against other modules).
 //
 // Output is stereo: voice 0 (and voice 1, if numOscillators is even) are
 // "center" voices summed into both channels, matching HypersawMaster::
@@ -66,6 +93,7 @@ namespace {
 
 constexpr int kMaxInstances = 8;
 constexpr int kMaxVoices = 64;  // matches HypersawMaster::numOscillatorsMax_
+constexpr double kPi = 3.14159265358979323846;
 
 double clampD(double value, double lo, double hi) {
   return value < lo ? lo : (value > hi ? hi : value);
@@ -86,12 +114,34 @@ unsigned int xorshift32(unsigned int& state) {
   return x;
 }
 
-// Returns a pseudo-random value in [-0.5, 0.5).
+// Returns a pseudo-random value in [-1, 1) -- matches NoiseGenerator's
+// runBipolar()/run(-1,1) range exactly.
 double randomBipolarUnit(unsigned int& state) {
-  return static_cast<double>(xorshift32(state) >> 8) * (1.0 / 16777216.0) - 0.5;
+  return static_cast<double>(xorshift32(state) >> 8) * (2.0 / 16777216.0) - 1.0;
 }
 
-// Standard PolyBLEP correction term for a naive sawtooth's discontinuity.
+// exp(x) via Taylor series -- freestanding WASM has no libm exp(). Only
+// ever called here with x = -2*pi*driftFrequency/sampleRate, always in a
+// modest negative range for musically sane drift rates.
+double expApprox(double x) {
+  // Range-reduce: exp(x) = exp(x/8)^8, keeps the Taylor series accurate
+  // over a wider domain than a direct series would allow.
+  double y = x * 0.125;
+  double e = 1.0 + y * (1.0 + y * (0.5 + y * (1.0 / 6.0 + y * (1.0 / 24.0 + y * (1.0 / 120.0)))));
+  e = e * e; e = e * e; e = e * e;
+  return e;
+}
+
+// curve::Rational{skew}.get(t), t already normalized 0..1 (min=0, max=1
+// in every call site here) -- transcribed exactly from
+// utility/curve_functions.hpp's Rational::get().
+double rationalCurve(double skew, double t) {
+  return ((1.0 + skew) * t) / (1.0 - skew + 2.0 * skew * t);
+}
+
+// Standard PolyBLEP correction term for a naive sawtooth's discontinuity
+// -- algebraically identical to PolyBLEP.hpp's private blep() (just
+// rearranged): blep(t,dt) = -(t/dt-1)^2 for t<dt, ((t-1)/dt+1)^2 for t>1-dt.
 double polyBlep(double t, double dt) {
   if (dt <= 0.0) return 0.0;
   if (t < dt) {
@@ -114,10 +164,10 @@ double fastSine01(double phase01) {
 }
 
 struct HypersawVoiceState {
-  double phase;           // main running accumulator, 0..1 (osc_'s own phase)
-  double randomOffset;    // randomPhaseOffset_: fixed per-voice random value, set at seed/reset
-  double driftLp;         // drift_'s current value (the walk's running position)
-  double driftStepTimer;  // samples remaining until drift_'s next fixed-size step
+  double phase;          // main running accumulator, 0..1 (osc_'s own phase)
+  double randomOffset;   // randomPhaseOffset_: fixed per-voice random value, set at seed/reset
+  double driftOut;       // drift_'s out_: the raw, hard-clamped random-walk accumulator
+  double driftFilterState;  // drift_'s lpf_ output state (buf_[1])
   unsigned int rngState;
 };
 
@@ -131,16 +181,11 @@ struct HypersawState {
 
 static HypersawState gPool[kMaxInstances];
 
-// The original's FlexibleRandomWalk "fixed_steps" method takes constant-
-// magnitude steps; this is that fixed magnitude (an implementation
-// constant, since the original's own default isn't available).
-constexpr double kDriftFixedStepSize = 0.12;
-
 void resetVoice(HypersawVoiceState& voice) {
   voice.phase = 0.0;
   voice.randomOffset = randomBipolarUnit(voice.rngState);
-  voice.driftLp = 0.0;
-  voice.driftStepTimer = 0.0;
+  voice.driftOut = 0.0;
+  voice.driftFilterState = 0.0;
 }
 
 void seedVoice(HypersawVoiceState& voice, int instanceIndex, int voiceIndex) {
@@ -171,10 +216,9 @@ extern "C" void soemdsp_hypersaw_destroy(int handle) {
   gPool[handle - 1].active = false;
 }
 
-// Note-trigger reset -- matches HypersawMaster::oscResetRanged() (called
-// from oscReset()): resets each voice's phase, redraws randomPhaseOffset_
-// (randomizePhase()), and zeroes drift_'s state, plus resets the shared
-// vibOsc_ phase.
+// Note-trigger reset -- matches HypersawMaster::oscReset(): redraws each
+// voice's randomPhaseOffset_ (randomizePhase()), zeroes phase and drift_
+// (out_=0, lpf_ reset), and resets the shared vibOsc_ phase.
 extern "C" void soemdsp_hypersaw_reset(int handle) {
   if (handle < 1 || handle > kMaxInstances) return;
   HypersawState& s = gPool[handle - 1];
@@ -194,11 +238,11 @@ extern "C" void soemdsp_hypersaw_reset(int handle) {
 // randomPhaseAmp: 0..1, scales each voice's fixed random phase offset
 //   (randomPhaseAmp_).
 // driftAmp: 0..1, scales each voice's random-walk phase offset (driftAmp_).
-// driftFrequency: Hz, the average rate at which drift_ takes a new fixed-
-//   size step (driftFrequency_).
-// driftJitter: 0..1, randomizes the interval between drift steps
-//   (driftJitterChanged()'s underlying value).
-// vibAmp: 0..1, how much the shared vibrato oscillator scales the static
+// driftFrequency: Hz -- drift_'s output lowpass cutoff (frequency_), also
+//   factors into the high-rate white-noise crossfade (see file header).
+// driftJitter: Hz -- drives drift_'s fixed-step magnitude (jitter_), also
+//   factors into the same white-noise crossfade.
+// vibAmp: 0..2, how much the shared vibrato oscillator scales the static
 //   (distribute+random) dispersion (vibAmp_).
 // vibOffset: the constant term added alongside vibAmp*vibInput in that
 //   same scaling factor (vibOffset_) -- with vibAmp=0, this alone
@@ -233,11 +277,31 @@ extern "C" void soemdsp_hypersaw_sample(
   const double distributeAmt = clampD(distributePhaseAmp, 0.0, 1.0);
   const double randomAmt = clampD(randomPhaseAmp, 0.0, 1.0);
   const double driftAmt = clampD(driftAmp, 0.0, 1.0);
-  const double driftJitterAmt = clampD(driftJitter, 0.0, 1.0);
-  const double safeDriftFrequency = driftFrequency > 0.01 ? driftFrequency : 0.01;
+  const double safeDriftFrequency = driftFrequency > 0.0 ? driftFrequency : 0.0;
+  const double safeDriftJitter = driftJitter > 0.0 ? driftJitter : 0.0;
   const double vibAmt = clampD(vibAmp, 0.0, 2.0);
   const double vibOffsetAmt = vibOffset;
   const double phaseIncrement = safeFrequency / safeSampleRate;
+
+  // drift_ coefficients -- shared across every voice (HypersawMaster
+  // slaves every voice's drift_ to voice 0's), transcribed exactly from
+  // FlexibleRandomWalk.hpp. Only computed when driftAmt > 0, matching
+  // drift_.run() only ever being called under that same guard.
+  double driftStepSize = 0.0, driftRandomMix = 0.0, driftWhiteNoiseMix = 0.0;
+  double driftA1 = 0.0, driftB0 = 0.0;
+  if (driftAmt > 0.0) {
+    const double jitterInc = safeDriftJitter / safeSampleRate;
+    driftStepSize = rationalCurve(0.99, jitterInc);
+    const double increment = safeDriftFrequency / safeSampleRate;
+    const double freqAndJitterAvg = (jitterInc + increment) * 0.5;
+    if (freqAndJitterAvg >= 0.9) {
+      const double normalized = (freqAndJitterAvg - 0.9) / 0.1;
+      driftWhiteNoiseMix = rationalCurve(-0.7, normalized);
+    }
+    driftRandomMix = 1.0 - driftWhiteNoiseMix;
+    driftA1 = expApprox(-2.0 * kPi * safeDriftFrequency / safeSampleRate);
+    driftB0 = 1.0 - driftA1;
+  }
 
   // vibOsc_ -- one shared oscillator per Hypersaw instance (not per
   // voice), matching `vibOsc_.phaseOffset_ = 0.5` at construction (a
@@ -253,17 +317,14 @@ extern "C" void soemdsp_hypersaw_sample(
 
     const double div = static_cast<double>(i) / static_cast<double>(voiceCount);
 
-    // drift_ (FlexibleRandomWalk, Method::fixed_steps): fixed-magnitude,
-    // random-sign steps at ~driftFrequency Hz, jittered timing.
-    voice.driftStepTimer -= 1.0;
-    if (voice.driftStepTimer <= 0.0) {
-      const double jitterFactor = 1.0 + randomBipolarUnit(voice.rngState) * 2.0 * driftJitterAmt;
-      double nominalInterval = (safeSampleRate / safeDriftFrequency) * jitterFactor;
-      if (nominalInterval < 1.0) nominalInterval = 1.0;
-      voice.driftStepTimer = nominalInterval;
-      voice.driftLp += randomBipolarUnit(voice.rngState) * 2.0 * kDriftFixedStepSize;
-      if (voice.driftLp > 0.5) voice.driftLp = 1.0 - voice.driftLp;
-      if (voice.driftLp < -0.5) voice.driftLp = -1.0 - voice.driftLp;
+    double walkOut = 0.0;
+    if (driftAmt > 0.0) {
+      const double n = randomBipolarUnit(voice.rngState);
+      const double r = n > 0.0 ? driftStepSize : -driftStepSize;
+      voice.driftOut = clampD(voice.driftOut + r, -1.0, 1.0);
+      const double raw = voice.driftOut * driftRandomMix + n * driftWhiteNoiseMix;
+      voice.driftFilterState = driftB0 * raw + driftA1 * voice.driftFilterState;
+      walkOut = voice.driftFilterState * driftAmt;
     }
 
     // vibInput_ only ever points at vibOsc_ for i >= 1 (see file header).
@@ -271,11 +332,11 @@ extern "C" void soemdsp_hypersaw_sample(
 
     const double staticDispersion = div * distributeAmt + voice.randomOffset * randomAmt;
     const double vibratoMultiplier = vibInputForVoice * vibAmt + vibOffsetAmt;
-    const double walkOut = driftAmt > 0.0 ? voice.driftLp * driftAmt : 0.0;
     const double dispersion = staticDispersion * vibratoMultiplier + walkOut;
 
     const double renderPhase = wrap01(voice.phase + phaseOffset + dispersion);
-    const double sawSample = 2.0 * renderPhase - 1.0 - polyBlep(renderPhase, phaseIncrement > 0.0 ? phaseIncrement : 1.0);
+    // PolyBLEP::saw(): 1 - 2*t + blep(t, dt) -- a descending ramp.
+    const double sawSample = 1.0 - 2.0 * renderPhase + polyBlep(renderPhase, phaseIncrement > 0.0 ? phaseIncrement : 1.0);
 
     voice.phase = wrap01(voice.phase + phaseIncrement);
 
@@ -319,5 +380,5 @@ extern "C" int soemdsp_hypersaw_max_voices() {
 }
 
 extern "C" int soemdsp_hypersaw_version() {
-  return 2;
+  return 3;
 }

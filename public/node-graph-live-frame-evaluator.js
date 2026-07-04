@@ -3031,9 +3031,9 @@ function evaluateNodeGraphPlanFrame(runtime, sampleRate, frame, frames) {
       if (resetEdge) {
         for (const voice of state.voices) {
           voice.phase = 0;
-          voice.randomOffset = Math.random() - 0.5;
-          voice.driftLp = 0;
-          voice.driftStepTimer = 0;
+          voice.randomOffset = Math.random() * 2 - 1;
+          voice.driftOut = 0;
+          voice.driftFilterState = 0;
         }
         state.vibPhase = 0;
       }

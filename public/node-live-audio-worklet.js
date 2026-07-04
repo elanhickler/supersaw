@@ -6808,8 +6808,13 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
     return 8 * x * (0.5 - Math.abs(x));
   }
 
+  // curve::Rational{skew}.get(t), t already normalized 0..1.
+  hypersawRationalCurve(skew, t) {
+    return ((1 + skew) * t) / (1 - skew + 2 * skew * t);
+  }
+
   createHypersawVoice() {
-    return { phase: 0, randomOffset: Math.random() - 0.5, driftLp: 0, driftStepTimer: 0 };
+    return { phase: 0, randomOffset: Math.random() * 2 - 1, driftOut: 0, driftFilterState: 0 };
   }
 
   createHypersawState() {
@@ -6843,13 +6848,33 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
     const distributeAmt = this.clampValue(Number(options.distributePhaseAmp) || 0, 0, 1);
     const randomAmt = this.clampValue(Number(options.randomPhaseAmp) || 0, 0, 1);
     const driftAmt = this.clampValue(Number(options.driftAmp) || 0, 0, 1);
-    const driftJitterAmt = this.clampValue(Number(options.driftJitter) || 0, 0, 1);
-    const safeDriftFrequency = Number(options.driftFrequency) > 0.01 ? Number(options.driftFrequency) : 0.01;
+    const safeDriftFrequency = Math.max(0, Number(options.driftFrequency) || 0);
+    const safeDriftJitter = Math.max(0, Number(options.driftJitter) || 0);
     const vibAmt = this.clampValue(Number(options.vibAmp) || 0, 0, 2);
     const vibOffsetAmt = Number(options.vibOffset) || 0;
     const vibRate = Number(options.vibRate) || 0;
 
     const phaseIncrement = safeFrequency / sampleRate;
+
+    // drift_ coefficients -- shared across every voice (only computed
+    // when driftAmt > 0, matching drift_.run() only ever being called
+    // under that same guard in the original). See hypersaw.cpp's header
+    // comment for the full derivation from FlexibleRandomWalk.hpp.
+    let driftStepSize = 0, driftRandomMix = 0, driftWhiteNoiseMix = 0;
+    let driftA1 = 0, driftB0 = 0;
+    if (driftAmt > 0) {
+      const jitterInc = safeDriftJitter / sampleRate;
+      driftStepSize = this.hypersawRationalCurve(0.99, jitterInc);
+      const increment = safeDriftFrequency / sampleRate;
+      const freqAndJitterAvg = (jitterInc + increment) * 0.5;
+      if (freqAndJitterAvg >= 0.9) {
+        const normalized = (freqAndJitterAvg - 0.9) / 0.1;
+        driftWhiteNoiseMix = this.hypersawRationalCurve(-0.7, normalized);
+      }
+      driftRandomMix = 1 - driftWhiteNoiseMix;
+      driftA1 = Math.exp((-2 * Math.PI * safeDriftFrequency) / sampleRate);
+      driftB0 = 1 - driftA1;
+    }
 
     state.vibPhase = this.hypersawWrap01(state.vibPhase + vibRate / sampleRate);
     const vibSample = this.hypersawFastSine01(state.vibPhase + 0.5);
@@ -6861,25 +6886,24 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
       const voice = state.voices[i];
       const div = i / numOscillators;
 
-      voice.driftStepTimer -= 1;
-      if (voice.driftStepTimer <= 0) {
-        const jitterFactor = 1 + (Math.random() * 2 - 1) * 2 * driftJitterAmt;
-        let nominalInterval = (sampleRate / safeDriftFrequency) * jitterFactor;
-        if (nominalInterval < 1) nominalInterval = 1;
-        voice.driftStepTimer = nominalInterval;
-        voice.driftLp += (Math.random() * 2 - 1) * 2 * 0.12;
-        if (voice.driftLp > 0.5) voice.driftLp = 1 - voice.driftLp;
-        if (voice.driftLp < -0.5) voice.driftLp = -1 - voice.driftLp;
+      let walkOut = 0;
+      if (driftAmt > 0) {
+        const n = Math.random() * 2 - 1;
+        const r = n > 0 ? driftStepSize : -driftStepSize;
+        voice.driftOut = this.clampValue(voice.driftOut + r, -1, 1);
+        const raw = voice.driftOut * driftRandomMix + n * driftWhiteNoiseMix;
+        voice.driftFilterState = driftB0 * raw + driftA1 * voice.driftFilterState;
+        walkOut = voice.driftFilterState * driftAmt;
       }
 
       const vibInputForVoice = i === 0 ? 0 : vibSample;
       const staticDispersion = div * distributeAmt + voice.randomOffset * randomAmt;
       const vibratoMultiplier = vibInputForVoice * vibAmt + vibOffsetAmt;
-      const walkOut = driftAmt > 0 ? voice.driftLp * driftAmt : 0;
       const dispersion = staticDispersion * vibratoMultiplier + walkOut;
 
       const renderPhase = this.hypersawWrap01(voice.phase + phaseOffset + dispersion);
-      sawSamples[i] = 2 * renderPhase - 1 - this.hypersawPolyBlep(renderPhase, phaseIncrement > 0 ? phaseIncrement : 1);
+      // PolyBLEP::saw(): 1 - 2*t + blep(t, dt) -- a descending ramp.
+      sawSamples[i] = 1 - 2 * renderPhase + this.hypersawPolyBlep(renderPhase, phaseIncrement > 0 ? phaseIncrement : 1);
       voicePhases[i] = this.hypersawWrap01(dispersion);
       voice.phase = this.hypersawWrap01(voice.phase + phaseIncrement);
     }
@@ -7844,9 +7868,9 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
         if (resetEdge) {
           for (const voice of state.voices) {
             voice.phase = 0;
-            voice.randomOffset = Math.random() - 0.5;
-            voice.driftLp = 0;
-            voice.driftStepTimer = 0;
+            voice.randomOffset = Math.random() * 2 - 1;
+            voice.driftOut = 0;
+            voice.driftFilterState = 0;
           }
           state.vibPhase = 0;
           if (state.nativeHandle && this.nativeHypersaw?.soemdsp_hypersaw_reset) {

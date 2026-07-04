@@ -1,21 +1,28 @@
 // Shared offline JS mirror of native_modules/hypersaw -- see that file's
-// header comment for the full derivation. Every parameter name here
-// matches native_modules/hypersaw/hypersaw.cpp exactly, which in turn
-// matches soundemote's own HypersawUnit::run() (docs/reference/
-// Hypersaw.hpp):
+// header comment for the full derivation, cross-checked against the real
+// soemdsp library headers (Wire.hpp, SampleRate.hpp,
+// random/FlexibleRandomWalk.hpp, filter/OnePoleFilter.hpp,
+// random/NoiseGenerator.hpp, utility/curve_functions.hpp,
+// oscillator/PolyBLEP.hpp). Every parameter name matches soundemote's
+// own HypersawUnit::run() (docs/reference/Hypersaw.hpp):
 //
 //   div               = i / numOscillators
 //   staticDispersion  = div * distributePhaseAmp + randomOffset * randomPhaseAmp
 //   vibratoMultiplier = vibInputForVoice * vibAmp + vibOffset   (vibInput only for voice i >= 1)
-//   walkOut           = driftAmp > 0 ? driftLp * driftAmp : 0
+//   walkOut           = driftAmp > 0 ? drift * driftAmp : 0
 //   dispersion        = staticDispersion * vibratoMultiplier + walkOut
 //
 // vibOffset=0 fully silences distributePhaseAmp/randomPhaseAmp regardless
 // of their own values -- that's the original's actual (multiplicative,
 // not additive) formula, not a bug.
+//
+// drift_ (FlexibleRandomWalk, Method::fixed_steps) is transcribed exactly
+// from the real FlexibleRandomWalk.hpp (a fixed-magnitude, random-sign
+// step accumulator, hard-clamped to [-1,1], then lowpass-filtered mixed
+// with raw white noise) -- see hypersaw.cpp's header comment for the
+// full derivation of driftStepSize/driftRandomMix/driftWhiteNoiseMix.
 
 const nodeGraphHypersawMaxVoices = 64;  // matches HypersawMaster::numOscillatorsMax_
-const nodeGraphHypersawDriftFixedStepSize = 0.12;
 
 function nodeGraphHypersawPolyBlep(t, dt) {
   if (dt <= 0) return 0;
@@ -42,12 +49,17 @@ function nodeGraphHypersawFastSine01(phase01) {
   return 8 * x * (0.5 - Math.abs(x));
 }
 
+// curve::Rational{skew}.get(t), t already normalized 0..1.
+function nodeGraphHypersawRationalCurve(skew, t) {
+  return ((1 + skew) * t) / (1 - skew + 2 * skew * t);
+}
+
 function nodeGraphHypersawCreateVoice() {
   return {
     phase: 0,
-    randomOffset: Math.random() - 0.5,
-    driftLp: 0,
-    driftStepTimer: 0,
+    randomOffset: Math.random() * 2 - 1,  // matches NoiseGenerator's run(-1,1)
+    driftOut: 0,
+    driftFilterState: 0,
   };
 }
 
@@ -61,7 +73,7 @@ function createNodeGraphHypersawState() {
 
 // options: { frequencyHz, sampleRate, phaseOffset (0..1), numOscillators (1..64),
 //   distributePhaseAmp (0..1), randomPhaseAmp (0..1), driftAmp (0..1),
-//   driftFrequency (Hz), driftJitter (0..1), vibAmp (0..2), vibOffset,
+//   driftFrequency (Hz), driftJitter (Hz), vibAmp (0..2), vibOffset,
 //   vibRate (Hz), level }
 // returns: { Left, Right, voicePhases: number[] } -- voicePhases is each
 // active voice's dispersion offset (0..1, wrapped), for the voice-position
@@ -76,14 +88,33 @@ function nodeGraphHypersawSample(state, options = {}) {
   const distributeAmt = clampNodeSliderValue(Number(options.distributePhaseAmp) || 0, 0, 1);
   const randomAmt = clampNodeSliderValue(Number(options.randomPhaseAmp) || 0, 0, 1);
   const driftAmt = clampNodeSliderValue(Number(options.driftAmp) || 0, 0, 1);
-  const driftJitterAmt = clampNodeSliderValue(Number(options.driftJitter) || 0, 0, 1);
-  const safeDriftFrequency = Number(options.driftFrequency) > 0.01 ? Number(options.driftFrequency) : 0.01;
+  const safeDriftFrequency = Math.max(0, Number(options.driftFrequency) || 0);
+  const safeDriftJitter = Math.max(0, Number(options.driftJitter) || 0);
   const vibAmt = clampNodeSliderValue(Number(options.vibAmp) || 0, 0, 2);
   const vibOffsetAmt = Number(options.vibOffset) || 0;
   const vibRate = Number(options.vibRate) || 0;
   const level = Number(options.level) || 0;
 
   const phaseIncrement = safeFrequency / sampleRate;
+
+  // drift_ coefficients -- shared across every voice (only computed when
+  // driftAmt > 0, matching drift_.run() only ever being called under
+  // that same guard in the original).
+  let driftStepSize = 0, driftRandomMix = 0, driftWhiteNoiseMix = 0;
+  let driftA1 = 0, driftB0 = 0;
+  if (driftAmt > 0) {
+    const jitterInc = safeDriftJitter / sampleRate;
+    driftStepSize = nodeGraphHypersawRationalCurve(0.99, jitterInc);
+    const increment = safeDriftFrequency / sampleRate;
+    const freqAndJitterAvg = (jitterInc + increment) * 0.5;
+    if (freqAndJitterAvg >= 0.9) {
+      const normalized = (freqAndJitterAvg - 0.9) / 0.1;
+      driftWhiteNoiseMix = nodeGraphHypersawRationalCurve(-0.7, normalized);
+    }
+    driftRandomMix = 1 - driftWhiteNoiseMix;
+    driftA1 = Math.exp((-2 * Math.PI * safeDriftFrequency) / sampleRate);
+    driftB0 = 1 - driftA1;
+  }
 
   // vibOsc_ -- one shared oscillator per Hypersaw instance, matching
   // `vibOsc_.phaseOffset_ = 0.5` at construction.
@@ -98,17 +129,14 @@ function nodeGraphHypersawSample(state, options = {}) {
     const voice = state.voices[i];
     const div = i / numOscillators;
 
-    // drift_ (FlexibleRandomWalk, Method::fixed_steps): fixed-magnitude,
-    // random-sign steps at ~driftFrequency Hz, jittered timing.
-    voice.driftStepTimer -= 1;
-    if (voice.driftStepTimer <= 0) {
-      const jitterFactor = 1 + (Math.random() * 2 - 1) * 2 * driftJitterAmt;
-      let nominalInterval = (sampleRate / safeDriftFrequency) * jitterFactor;
-      if (nominalInterval < 1) nominalInterval = 1;
-      voice.driftStepTimer = nominalInterval;
-      voice.driftLp += (Math.random() * 2 - 1) * 2 * nodeGraphHypersawDriftFixedStepSize;
-      if (voice.driftLp > 0.5) voice.driftLp = 1 - voice.driftLp;
-      if (voice.driftLp < -0.5) voice.driftLp = -1 - voice.driftLp;
+    let walkOut = 0;
+    if (driftAmt > 0) {
+      const n = Math.random() * 2 - 1;
+      const r = n > 0 ? driftStepSize : -driftStepSize;
+      voice.driftOut = clampNodeSliderValue(voice.driftOut + r, -1, 1);
+      const raw = voice.driftOut * driftRandomMix + n * driftWhiteNoiseMix;
+      voice.driftFilterState = driftB0 * raw + driftA1 * voice.driftFilterState;
+      walkOut = voice.driftFilterState * driftAmt;
     }
 
     // vibInput_ only ever points at vibOsc_ for i >= 1.
@@ -116,11 +144,11 @@ function nodeGraphHypersawSample(state, options = {}) {
 
     const staticDispersion = div * distributeAmt + voice.randomOffset * randomAmt;
     const vibratoMultiplier = vibInputForVoice * vibAmt + vibOffsetAmt;
-    const walkOut = driftAmt > 0 ? voice.driftLp * driftAmt : 0;
     const dispersion = staticDispersion * vibratoMultiplier + walkOut;
 
     const renderPhase = nodeGraphHypersawWrap01(voice.phase + phaseOffset + dispersion);
-    const sawSample = 2 * renderPhase - 1 - nodeGraphHypersawPolyBlep(renderPhase, phaseIncrement > 0 ? phaseIncrement : 1);
+    // PolyBLEP::saw(): 1 - 2*t + blep(t, dt) -- a descending ramp.
+    const sawSample = 1 - 2 * renderPhase + nodeGraphHypersawPolyBlep(renderPhase, phaseIncrement > 0 ? phaseIncrement : 1);
 
     voicePhases[i] = nodeGraphHypersawWrap01(dispersion);
     voice.phase = nodeGraphHypersawWrap01(voice.phase + phaseIncrement);
