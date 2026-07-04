@@ -2694,7 +2694,7 @@ function nodeGraphTraceDisplaySettingsEditingTraceDefaults() {
   return nodeGraphModuleDisplaySettingsSchemaForNode(node) === "trace";
 }
 
-const nodeGraphDisplayModeRenderers = Object.freeze(["trace", "clock", "dot", "value", "lineBurn", "scope2d", "scope2dTrace", "numberReadout"]);
+const nodeGraphDisplayModeRenderers = Object.freeze(["trace", "clock", "dot", "value", "lineBurn", "hypersawBurn", "scope2d", "scope2dTrace", "numberReadout"]);
 const nodeGraphDisplayModeSignalKinds = Object.freeze(["scalar", "xy", "buffer"]);
 
 function nodeGraphDisplayModeSettingsSchemaForRenderer(renderer) {
@@ -9845,6 +9845,54 @@ function drawNodeGraphLineBurnOscilloscopeItem(renderer, item, pixelRatio) {
   );
 }
 
+// Draws one vertical phosphor-burn line per Hypersaw voice, at x = that
+// voice's current rendered phase (0..1) mapped across the display's
+// width. Reuses the exact same WebGL additive-burn + decay pipeline as
+// lineBurn (drawNodeGraphRetainedBurnPath), just fed a different shape of
+// points: a top/bottom pair per voice (a vertical segment) separated by a
+// `null` path-break so voices don't connect diagonally to each other.
+// Voice phase snapshots come from nodeGraphModuleScopeState.hypersawVoicePhases,
+// populated directly by the frame evaluator's "hypersaw" dispatch case
+// (node-graph-live-frame-evaluator.js) each time it renders that node --
+// independent of the lineBurn buffer/capture pipeline, since that
+// pipeline only carries single scalar values per port, not a voice array.
+function drawNodeGraphHypersawBurnItem(renderer, item, pixelRatio) {
+  const node = nodeGraphModuleScopeNodeForSlot(item?.slot);
+  const nodeId = item?.slot?.nodeId;
+  if (!node || !nodeId) {
+    return;
+  }
+  const settings = nodeGraphLineBurnSettingsForNode(node);
+  const canvas = nodeGraphScope2dBurnCanvasForSlot(item?.slot);
+  if (!canvas) {
+    return;
+  }
+  const screenElement = item?.screenElement || item?.slot?.scopeElement;
+  const sync = syncNodeGraphScope2dBurnCanvas(canvas, screenElement, pixelRatio);
+  if (!sync.synced) {
+    return;
+  }
+  const square = nodeGraphScope2dBurnCanvasSquare(canvas);
+  if (!square) {
+    return;
+  }
+  const phases = nodeGraphModuleScopeState.hypersawVoicePhases?.get(String(nodeId));
+  const points = [];
+  if (Array.isArray(phases)) {
+    for (const phase of phases) {
+      const p = Number(phase);
+      if (!Number.isFinite(p)) {
+        continue;
+      }
+      const x = square.left + clampNodeSliderValue(p, 0, 1) * square.width;
+      points.push({ x, y: square.top });
+      points.push({ x, y: square.top + square.height });
+      points.push(null);
+    }
+  }
+  drawNodeGraphRetainedBurnPath(item, pixelRatio, points, settings);
+}
+
 function nodeGraphScope2dFiniteSample(value) {
   const sample = Number(value);
   return Number.isFinite(sample) ? sample : null;
@@ -10403,6 +10451,10 @@ function drawNodeGraphModuleScopeTypedItem(renderer, item, pixelRatio) {
   }
   if (displayRenderer === "lineBurn") {
     drawNodeGraphLineBurnOscilloscopeItem(renderer, item, pixelRatio);
+    return true;
+  }
+  if (displayRenderer === "hypersawBurn") {
+    drawNodeGraphHypersawBurnItem(renderer, item, pixelRatio);
     return true;
   }
   if (displayRenderer === "scope2dTrace") {

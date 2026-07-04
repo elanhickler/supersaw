@@ -29,6 +29,7 @@ const nodeGraphModuleStoreTypes = Object.freeze([
   "surgeOscillator",
   "dsfOscillator",
   "robinSupersaw",
+  "hypersaw",
   "arpeggiator",
   "spiral",
   "blubb",
@@ -420,6 +421,12 @@ const nodeGraphModuleStoreCatalog = Object.freeze({
     description: "A proof-of-concept supersaw built on Robin Schmidt's pitch dithering technique (RobinSchmidt/RS-MET, rsPitchDitherOsc) -- see this repo's README for the full explanation. Instead of correcting or avoiding the aliasing edge, each voice dithers its own cycle length between 3 neighboring integer sample-counts so every individual cycle rendered is exactly periodic (alias-free), trading aliasing for a small amount of pitch-jitter noise. Stacks up to 9 independently-dithered, detuned voices (Detune spreads them symmetrically in cents around a centered anchor voice) and sums them into a classic wall-of-saws supersaw. Native C++/WASM.",
     label: "RobinSupersaw",
     notes: ["oscillator", "supersaw", "pitch dithering", "anti-aliasing", "native"],
+  },
+  hypersaw: {
+    category: "Oscillator",
+    description: "A proof-of-concept port of soundemote's own HypersawUnit/HypersawMaster (see docs/reference/Hypersaw.hpp) -- a bank of up to 32 bandlimited (PolyBLEP) sawtooths spread across the phase cycle. Each voice's phase is dispersed three ways: Spread (scales the voice's fixed even position i/N across the cycle), Random (a fixed per-voice random offset), and Drift (a slow, continuously wandering per-voice offset). Center voices sum to both channels; the rest alternate Left/Right. The display burns one vertical phosphor line per voice at its current phase position (0..1 across the width). Native C++/WASM.",
+    label: "Hypersaw",
+    notes: ["oscillator", "supersaw", "polyblep", "anti-aliasing", "native", "phosphor display"],
   },
   arpeggiator: {
     category: "Sequence",

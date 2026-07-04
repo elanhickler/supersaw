@@ -68,6 +68,17 @@
       "wasmAvailable": true
     },
     {
+      "name": "hypersaw",
+      "label": "Hypersaw",
+      "targetType": "hypersaw",
+      "kind": "oscillator",
+      "source": "native_modules/hypersaw/hypersaw.cpp",
+      "sourceUrl": "https://github.com/soundemote/soemdsp-sandbox/blob/master/native_modules/hypersaw/hypersaw.cpp",
+      "wasm": "native_modules/hypersaw/hypersaw.wasm",
+      "wasmUrl": "native_modules/hypersaw/hypersaw.wasm",
+      "wasmAvailable": true
+    },
+    {
       "name": "ladder_filter",
       "label": "Ladder Filter",
       "targetType": "ladderFilter",

@@ -340,6 +340,26 @@ if (!(Test-Path -LiteralPath $clang)) {
   -fno-exceptions `
   -fno-rtti `
   "-Wl,--no-entry" `
+  "-Wl,--export=soemdsp_hypersaw_create" `
+  "-Wl,--export=soemdsp_hypersaw_destroy" `
+  "-Wl,--export=soemdsp_hypersaw_reset" `
+  "-Wl,--export=soemdsp_hypersaw_sample" `
+  "-Wl,--export=soemdsp_hypersaw_left" `
+  "-Wl,--export=soemdsp_hypersaw_right" `
+  "-Wl,--export=soemdsp_hypersaw_voice_phase" `
+  "-Wl,--export=soemdsp_hypersaw_max_voices" `
+  "-Wl,--export=soemdsp_hypersaw_version" `
+  "-Wl,--export-memory" `
+  -o "$root\native_modules\hypersaw\hypersaw.wasm" `
+  "$root\native_modules\hypersaw\hypersaw.cpp"
+
+& $clang `
+  --target=wasm32 `
+  -O3 `
+  -nostdlib `
+  -fno-exceptions `
+  -fno-rtti `
+  "-Wl,--no-entry" `
   "-Wl,--export=soemdsp_henon_map_create" `
   "-Wl,--export=soemdsp_henon_map_destroy" `
   "-Wl,--export=soemdsp_henon_map_sample" `

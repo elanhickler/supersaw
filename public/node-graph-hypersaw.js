@@ -1,0 +1,115 @@
+// Shared offline JS mirror of native_modules/hypersaw -- Hypersaw, a bank
+// of up to 32 bandlimited (PolyBLEP) sawtooth voices spread across the
+// phase cycle. See native_modules/hypersaw/hypersaw.cpp for the full
+// derivation and the mapping back to soundemote's own HypersawUnit/
+// HypersawMaster (docs/reference/Hypersaw.hpp).
+//
+// Each voice keeps its own phase accumulator at the shared base
+// frequency. The accumulator's rendered phase is displaced by three
+// independent, additive dispersion sources:
+//   spread  -- scales the voice's fixed even position i/numVoices.
+//   random  -- scales a fixed random offset drawn once per voice.
+//   drift   -- scales a slow, continuously wandering (lowpassed noise)
+//              per-voice offset.
+// Center voices (voice 0, and voice 1 if numVoices is even) sum into
+// both channels; the rest alternate Left/Right. Each channel is averaged
+// (not summed) by its own contributor count so voice count doesn't
+// change overall loudness -- same convention as this sandbox's
+// RobinSupersaw module.
+
+const nodeGraphHypersawMaxVoices = 32;
+
+function nodeGraphHypersawPolyBlep(t, dt) {
+  if (dt <= 0) return 0;
+  if (t < dt) {
+    const x = t / dt;
+    return x + x - x * x - 1;
+  }
+  if (t > 1 - dt) {
+    const x = (t - 1) / dt;
+    return x * x + x + x + 1;
+  }
+  return 0;
+}
+
+function nodeGraphHypersawWrap01(x) {
+  const w = x - Math.floor(x);
+  return w < 0 ? 0 : (w >= 1 ? 0 : w);
+}
+
+function nodeGraphHypersawCreateVoice() {
+  return {
+    phase: 0,
+    randomOffset: Math.random() - 0.5,
+    driftLp: 0,
+  };
+}
+
+function createNodeGraphHypersawState() {
+  const voices = [];
+  for (let i = 0; i < nodeGraphHypersawMaxVoices; i++) {
+    voices.push(nodeGraphHypersawCreateVoice());
+  }
+  return { voices };
+}
+
+// options: { frequencyHz, sampleRate, phaseOffset (0..1), numVoices (1..32),
+//   spread (0..1), randomAmount (0..1), driftAmount (0..1), level }
+// returns: { Left, Right, voicePhases: number[] } -- voicePhases is the
+// post-dispersion rendered phase (0..1) of each active voice, in order,
+// for driving the phosphor-burn display.
+function nodeGraphHypersawSample(state, options = {}) {
+  const sampleRate = Number(options.sampleRate) > 1 ? Number(options.sampleRate) : 48000;
+  const safeFrequency = Number(options.frequencyHz) > 0 ? Number(options.frequencyHz) : 0;
+  const phaseOffset = nodeGraphHypersawWrap01(Number(options.phaseOffset) || 0);
+  const numVoices = clampNodeSliderValue(Math.round(Number(options.numVoices) || 1), 1, nodeGraphHypersawMaxVoices);
+  const spreadAmt = clampNodeSliderValue(Number(options.spread) || 0, 0, 1);
+  const randomAmt = clampNodeSliderValue(Number(options.randomAmount) || 0, 0, 1);
+  const driftAmt = clampNodeSliderValue(Number(options.driftAmount) || 0, 0, 1);
+  const level = Number(options.level) || 0;
+
+  // One-pole lowpass coefficient for a ~0.35Hz corner.
+  const driftCoeff = 1 - Math.exp((-2 * Math.PI * 0.35) / sampleRate);
+  const phaseIncrement = safeFrequency / sampleRate;
+
+  let leftSum = 0, rightSum = 0;
+  let leftCount = 0, rightCount = 0;
+  const voicePhases = new Array(numVoices);
+
+  for (let i = 0; i < numVoices; i++) {
+    const voice = state.voices[i];
+    const basePosition = i / numVoices;
+    const noiseSample = Math.random() - 0.5;
+    voice.driftLp += (noiseSample - voice.driftLp) * driftCoeff;
+
+    const dispersion = basePosition * spreadAmt + voice.randomOffset * randomAmt + voice.driftLp * driftAmt;
+    const renderPhase = nodeGraphHypersawWrap01(voice.phase + phaseOffset + dispersion);
+    const sawSample = 2 * renderPhase - 1 - nodeGraphHypersawPolyBlep(renderPhase, phaseIncrement > 0 ? phaseIncrement : 1);
+
+    voicePhases[i] = renderPhase;
+    voice.phase = nodeGraphHypersawWrap01(voice.phase + phaseIncrement);
+
+    const isCenter = i === 0 || (i === 1 && numVoices % 2 === 0);
+    if (isCenter) {
+      leftSum += sawSample;
+      rightSum += sawSample;
+      leftCount++;
+      rightCount++;
+    } else if (i % 2 === 0) {
+      leftSum += sawSample;
+      leftCount++;
+    } else {
+      rightSum += sawSample;
+      rightCount++;
+    }
+  }
+
+  let left = leftCount > 0 ? leftSum / leftCount : 0;
+  let right = rightCount > 0 ? rightSum / rightCount : 0;
+  if (!Number.isFinite(left)) left = 0;
+  if (!Number.isFinite(right)) right = 0;
+
+  const outLeft = clampNodeSliderValue(left, -1.5, 1.5) * level;
+  const outRight = clampNodeSliderValue(right, -1.5, 1.5) * level;
+  return { Left: outLeft, Right: outRight, voicePhases };
+}

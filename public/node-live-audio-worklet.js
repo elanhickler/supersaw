@@ -169,6 +169,7 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
     this.surgeOscillatorStates = new Map();
     this.dsfOscillatorStates = new Map();
     this.robinSupersawStates = new Map();
+    this.hypersawStates = new Map();
     this.noiseGeneratorStates = new Map();
     this.oscResetStates = new Map();
     this.graphLfoStates = new Map();
@@ -691,6 +692,22 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
         });
         return;
       }
+      if (name === "hypersaw" || targetType === "hypersaw") {
+        for (const state of this.hypersawStates.values()) {
+          this.destroyHypersawNativeState(state);
+        }
+        this.nativeHypersaw = exports;
+        this.nativeHypersawReady = Boolean(
+          this.nativeHypersaw?.soemdsp_hypersaw_create &&
+          this.nativeHypersaw?.soemdsp_hypersaw_sample,
+        );
+        this.port.postMessage({
+          type: "nativeModuleStatus",
+          name: "hypersaw",
+          status: this.nativeHypersawReady ? "ready" : "missing exports",
+        });
+        return;
+      }
       if (name === "shooting_star_explosion" || targetType === "shootingStarExplosion") {
         this.nativeShootingStarExplosion = exports;
         this.nativeShootingStarExplosionReady = Boolean(
@@ -808,6 +825,7 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
     this.surgeOscillatorStates = new Map();
     this.dsfOscillatorStates = new Map();
     this.robinSupersawStates = new Map();
+    this.hypersawStates = new Map();
     this.noiseGeneratorStates = new Map();
     this.oscResetStates = new Map();
     this.graphLfoStates = new Map();
@@ -1069,6 +1087,9 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
       if (node?.type === "robinSupersaw" && !this.robinSupersawStates.has(id)) {
         this.robinSupersawStates.set(id, this.createRobinSupersawState());
       }
+      if (node?.type === "hypersaw" && !this.hypersawStates.has(id)) {
+        this.hypersawStates.set(id, this.createHypersawState());
+      }
       if (node?.type === "passiveFilter" && !this.passiveFilterStates.has(id)) {
         this.passiveFilterStates.set(id, this.createPassiveFilterState());
       }
@@ -1282,6 +1303,12 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
       if (!ids.has(id)) {
         this.destroyRobinSupersawNativeState(this.robinSupersawStates.get(id));
         this.robinSupersawStates.delete(id);
+      }
+    }
+    for (const id of [...this.hypersawStates.keys()]) {
+      if (!ids.has(id)) {
+        this.destroyHypersawNativeState(this.hypersawStates.get(id));
+        this.hypersawStates.delete(id);
       }
     }
     for (const id of [...this.passiveFilterStates.keys()]) {
@@ -2432,10 +2459,17 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
       }]);
       state.postedFrame = absoluteFrame;
     }
-    if (!values.length) {
+    const hypersawVoicePhases = [];
+    for (const [nodeId, state] of this.hypersawStates) {
+      if (Array.isArray(state?.lastVoicePhases) && state.lastVoicePhases.length) {
+        hypersawVoicePhases.push([nodeId, state.lastVoicePhases]);
+      }
+    }
+    if (!values.length && !hypersawVoicePhases.length) {
       return;
     }
     this.port.postMessage({
+      ...(hypersawVoicePhases.length ? { hypersawVoicePhases } : {}),
       patchFingerprint: this.patchFingerprint,
       sampleRate: engineSampleRate,
       sessionId: this.sessionId,
@@ -3810,6 +3844,7 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
       if (node?.type === "surgeOscillator") this.surgeOscillatorStates.set(id, this.createSurgeOscillatorState());
       if (node?.type === "dsfOscillator") this.dsfOscillatorStates.set(id, this.createDsfOscillatorState());
       if (node?.type === "robinSupersaw") this.robinSupersawStates.set(id, this.createRobinSupersawState());
+      if (node?.type === "hypersaw") this.hypersawStates.set(id, this.createHypersawState());
       if (node?.type === "passiveFilter") this.passiveFilterStates.set(id, this.createPassiveFilterState());
       if (node?.type === "cookbookFilter") this.cookbookFilterStates.set(id, this.createCookbookFilterState());
       if (node?.type === "ladderFilter") this.ladderFilterStates.set(id, this.createLadderFilterState());
@@ -6741,6 +6776,177 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
     return this.robinSupersawSampleJs(state, options);
   }
 
+  // Hypersaw -- see native_modules/hypersaw/hypersaw.cpp for the full
+  // derivation (a proof-of-concept port of soundemote's own
+  // HypersawUnit/HypersawMaster, docs/reference/Hypersaw.hpp). Fully
+  // self-contained JS fallback for the same isolated-worklet-scope reason
+  // as RobinSupersaw above -- never calls the shared
+  // public/node-graph-hypersaw.js globals, which this worklet's isolated
+  // scope never loads.
+
+  hypersawPolyBlep(t, dt) {
+    if (dt <= 0) return 0;
+    if (t < dt) {
+      const x = t / dt;
+      return x + x - x * x - 1;
+    }
+    if (t > 1 - dt) {
+      const x = (t - 1) / dt;
+      return x * x + x + x + 1;
+    }
+    return 0;
+  }
+
+  hypersawWrap01(x) {
+    const w = x - Math.floor(x);
+    return w < 0 ? 0 : (w >= 1 ? 0 : w);
+  }
+
+  createHypersawVoice() {
+    return { phase: 0, randomOffset: Math.random() - 0.5, driftLp: 0 };
+  }
+
+  createHypersawState() {
+    const voices = [];
+    for (let i = 0; i < 32; i++) {
+      voices.push(this.createHypersawVoice());
+    }
+    return { voices, nativeHandle: 0 };
+  }
+
+  destroyHypersawNativeState(state) {
+    if (state?.nativeHandle && this.nativeHypersaw?.soemdsp_hypersaw_destroy) {
+      this.nativeHypersaw.soemdsp_hypersaw_destroy(state.nativeHandle);
+      state.nativeHandle = 0;
+    }
+  }
+
+  // Advances each voice's phase accumulator + drift/dispersion exactly
+  // once per sample() call and returns the per-voice sawtooth samples
+  // plus the post-dispersion renderPhase array (used to drive the
+  // phosphor-burn display). Factored out of hypersawSampleJs so the
+  // native-audio path below can call it too (advancing this JS shadow
+  // state purely for the display, in parallel with native's own opaque
+  // internal state) without duplicating -- and thereby double-stepping --
+  // the phase math.
+  hypersawAdvanceVoices(state, options = {}) {
+    const sampleRate = Number(options.sampleRate) > 1 ? Number(options.sampleRate) : 48000;
+    const safeFrequency = Number(options.frequencyHz) > 0 ? Number(options.frequencyHz) : 0;
+    const phaseOffset = this.hypersawWrap01(Number(options.phaseOffset) || 0);
+    const numVoices = this.clampValue(Math.round(Number(options.numVoices) || 1), 1, 32);
+    const spreadAmt = this.clampValue(Number(options.spread) || 0, 0, 1);
+    const randomAmt = this.clampValue(Number(options.randomAmount) || 0, 0, 1);
+    const driftAmt = this.clampValue(Number(options.driftAmount) || 0, 0, 1);
+
+    const driftCoeff = 1 - Math.exp((-2 * Math.PI * 0.35) / sampleRate);
+    const phaseIncrement = safeFrequency / sampleRate;
+
+    const sawSamples = new Array(numVoices);
+    const voicePhases = new Array(numVoices);
+
+    for (let i = 0; i < numVoices; i++) {
+      const voice = state.voices[i];
+      const basePosition = i / numVoices;
+      const noiseSample = Math.random() - 0.5;
+      voice.driftLp += (noiseSample - voice.driftLp) * driftCoeff;
+
+      const dispersion = basePosition * spreadAmt + voice.randomOffset * randomAmt + voice.driftLp * driftAmt;
+      const renderPhase = this.hypersawWrap01(voice.phase + phaseOffset + dispersion);
+      sawSamples[i] = 2 * renderPhase - 1 - this.hypersawPolyBlep(renderPhase, phaseIncrement > 0 ? phaseIncrement : 1);
+      voicePhases[i] = renderPhase;
+      voice.phase = this.hypersawWrap01(voice.phase + phaseIncrement);
+    }
+
+    state.lastVoicePhases = voicePhases;
+    return { sawSamples, numVoices };
+  }
+
+  hypersawSampleJs(state, options = {}) {
+    const level = Number(options.level) || 0;
+    const { sawSamples, numVoices } = this.hypersawAdvanceVoices(state, options);
+
+    let leftSum = 0, rightSum = 0;
+    let leftCount = 0, rightCount = 0;
+
+    for (let i = 0; i < numVoices; i++) {
+      const sawSample = sawSamples[i];
+      const isCenter = i === 0 || (i === 1 && numVoices % 2 === 0);
+      if (isCenter) {
+        leftSum += sawSample;
+        rightSum += sawSample;
+        leftCount++;
+        rightCount++;
+      } else if (i % 2 === 0) {
+        leftSum += sawSample;
+        leftCount++;
+      } else {
+        rightSum += sawSample;
+        rightCount++;
+      }
+    }
+
+    let left = leftCount > 0 ? leftSum / leftCount : 0;
+    let right = rightCount > 0 ? rightSum / rightCount : 0;
+    if (!Number.isFinite(left)) left = 0;
+    if (!Number.isFinite(right)) right = 0;
+
+    return { Left: this.clampValue(left, -1.5, 1.5) * level, Right: this.clampValue(right, -1.5, 1.5) * level };
+  }
+
+  hypersawSample(state, options = {}) {
+    if (
+      this.nativeHypersawReady &&
+      this.nativeHypersaw?.soemdsp_hypersaw_create &&
+      this.nativeHypersaw?.soemdsp_hypersaw_sample
+    ) {
+      try {
+        if (!state.nativeHandle) {
+          state.nativeHandle = this.nativeHypersaw.soemdsp_hypersaw_create();
+        }
+        if (state.nativeHandle) {
+          const sampleRate = Number(options.sampleRate) > 1 ? Number(options.sampleRate) : 48000;
+          const frequencyHz = Number(options.frequencyHz) || 0;
+          const phaseOffset = Number(options.phaseOffset) || 0;
+          const numVoices = Math.round(Number(options.numVoices) || 1);
+          const spread = Number(options.spread) || 0;
+          const randomAmount = Number(options.randomAmount) || 0;
+          const driftAmount = Number(options.driftAmount) || 0;
+          const level = Number(options.level) || 0;
+          this.nativeHypersaw.soemdsp_hypersaw_sample(
+            state.nativeHandle,
+            frequencyHz,
+            sampleRate,
+            phaseOffset,
+            numVoices,
+            spread,
+            randomAmount,
+            driftAmount,
+            level,
+          );
+          // Native owns the real audio-critical voice state opaquely (no
+          // access from JS). Advance this JS-side shadow bank purely so
+          // the phosphor-burn display has phase data to draw -- visually
+          // representative of the dispersion in effect, though not
+          // sample-exact with native's own internal RNG stream.
+          this.hypersawAdvanceVoices(state, options);
+          return {
+            Left: Number(this.nativeHypersaw.soemdsp_hypersaw_left(state.nativeHandle)) || 0,
+            Right: Number(this.nativeHypersaw.soemdsp_hypersaw_right(state.nativeHandle)) || 0,
+          };
+        }
+      } catch (error) {
+        this.nativeHypersawReady = false;
+        this.port.postMessage({
+          type: "nativeModuleStatus",
+          name: "hypersaw",
+          status: "disabled",
+          message: String(error?.message || error || "native Hypersaw failed"),
+        });
+      }
+    }
+    return this.hypersawSampleJs(state, options);
+  }
+
   spiralWrap01(value) {
     return value - Math.floor(value);
   }
@@ -6980,12 +7186,12 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
         );
         const freqInput = this.safeFilterNumber(mixInput(nodeId, "Freq"), null);
         const ampInput = this.safeFilterNumber(mixInput(nodeId, "Amplitude"), null);
-        const pitchInput = this.clampValue(
-          this.safeFilterNumber(mixInput(nodeId, "0.1V/Oct"), null),
-          -1,
-          1,
-        );
-        const pitchedFrequency = Math.max(0, (baseFrequency + freqInput) * (2 ** (pitchInput / 0.1)));
+        const referenceMidiNote = Number.isFinite(this.pitchReferenceMidiNote) ? this.pitchReferenceMidiNote : 48;
+        const referenceVoltage = referenceMidiNote / 120;
+        const pitchInput = hasInput(nodeId, "0.1V/Oct")
+          ? this.clampValue(this.safeFilterNumber(mixInput(nodeId, "0.1V/Oct"), null), -1, 1)
+          : referenceVoltage;
+        const pitchedFrequency = Math.max(0, (baseFrequency + freqInput) * (2 ** ((pitchInput - referenceVoltage) / 0.1)));
         const amplitude = Math.max(0, this.readEffectiveParameter(
           node,
           "amp",
@@ -7030,12 +7236,16 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
           frameValues,
         );
         const incrementInput = this.safeFilterNumber(mixInput(nodeId, "Increment"), null);
-        const pitchInput = this.clampValue(
-          this.safeFilterNumber(mixInput(nodeId, "0.1V/Oct"), null),
-          -1,
-          1,
-        );
-        const pitchedFrequency = Math.max(0, frequency * (2 ** (pitchInput / 0.1)));
+        const referenceMidiNote = Number.isFinite(this.pitchReferenceMidiNote) ? this.pitchReferenceMidiNote : 48;
+        const referenceVoltage = referenceMidiNote / 120;
+        // With nothing patched into 0.1V/Oct, an oscillator should just
+        // sound at its own "frequency" parameter -- i.e. as if it's always
+        // playing the global pitch reference note -- not transposed by
+        // whatever octave the reference note happens to sit at.
+        const pitchInput = hasInput(nodeId, "0.1V/Oct")
+          ? this.clampValue(this.safeFilterNumber(mixInput(nodeId, "0.1V/Oct"), null), -1, 1)
+          : referenceVoltage;
+        const pitchedFrequency = Math.max(0, frequency * (2 ** ((pitchInput - referenceVoltage) / 0.1)));
         const phaseIncrement = (pitchedFrequency / safeRate) + incrementInput;
         const level = this.readEffectiveParameter(node, "level", 1, frame, frames, frameValues);
         let nativeVector = null;
@@ -7102,12 +7312,16 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
           frames,
           frameValues,
         );
-        const pitchInput = this.clampValue(
-          this.safeFilterNumber(mixInput(nodeId, "0.1V/Oct"), null),
-          -1,
-          1,
-        );
-        const pitchedFrequency = Math.max(0, frequency * (2 ** (pitchInput / 0.1)));
+        const referenceMidiNote = Number.isFinite(this.pitchReferenceMidiNote) ? this.pitchReferenceMidiNote : 48;
+        const referenceVoltage = referenceMidiNote / 120;
+        // With nothing patched into 0.1V/Oct, an oscillator should just
+        // sound at its own "frequency" parameter -- i.e. as if it's always
+        // playing the global pitch reference note -- not transposed by
+        // whatever octave the reference note happens to sit at.
+        const pitchInput = hasInput(nodeId, "0.1V/Oct")
+          ? this.clampValue(this.safeFilterNumber(mixInput(nodeId, "0.1V/Oct"), null), -1, 1)
+          : referenceVoltage;
+        const pitchedFrequency = Math.max(0, frequency * (2 ** ((pitchInput - referenceVoltage) / 0.1)));
         const incrementInput = this.safeFilterNumber(mixInput(nodeId, "Increment"), null);
         const phaseIncrement = (pitchedFrequency / safeRate) + incrementInput;
         const hasGraphInput = (
@@ -7151,12 +7365,16 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
           this.readEffectiveParameter(node, "phase", 0, frame, frames, frameValues),
         );
         const frequency = this.readEffectiveParameter(node, "frequency", 100, frame, frames, frameValues);
-        const pitchInput = this.clampValue(
-          this.safeFilterNumber(mixInput(nodeId, "0.1V/Oct"), null),
-          -1,
-          1,
-        );
-        const pitchedFrequency = Math.max(0, frequency * (2 ** (pitchInput / 0.1)));
+        const referenceMidiNote = Number.isFinite(this.pitchReferenceMidiNote) ? this.pitchReferenceMidiNote : 48;
+        const referenceVoltage = referenceMidiNote / 120;
+        // With nothing patched into 0.1V/Oct, an oscillator should just
+        // sound at its own "frequency" parameter -- i.e. as if it's always
+        // playing the global pitch reference note -- not transposed by
+        // whatever octave the reference note happens to sit at.
+        const pitchInput = hasInput(nodeId, "0.1V/Oct")
+          ? this.clampValue(this.safeFilterNumber(mixInput(nodeId, "0.1V/Oct"), null), -1, 1)
+          : referenceVoltage;
+        const pitchedFrequency = Math.max(0, frequency * (2 ** ((pitchInput - referenceVoltage) / 0.1)));
         const incrementInput = this.safeFilterNumber(mixInput(nodeId, "Increment"), null);
         const phaseIncrement = (pitchedFrequency / safeRate) + incrementInput;
         let ellipsoidFrame = this.ellipsoidOutputFrames.get(nodeId);
@@ -7516,12 +7734,12 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
         this.surgeOscillatorStates.set(nodeId, state);
         const read = (key, fallback) => this.readEffectiveParameter(node, key, fallback, frame, frames, frameValues);
         const baseFrequency = Math.max(0, read("frequency", 100));
-        const pitchInput = this.clampValue(
-          this.safeFilterNumber(mixInput(nodeId, "0.1V/Oct"), null),
-          -10,
-          10,
-        );
-        const frequencyHz = Math.max(0, baseFrequency * (2 ** (pitchInput / 0.1)));
+        const referenceMidiNote = Number.isFinite(this.pitchReferenceMidiNote) ? this.pitchReferenceMidiNote : 48;
+        const referenceVoltage = referenceMidiNote / 120;
+        const pitchInput = hasInput(nodeId, "0.1V/Oct")
+          ? this.clampValue(this.safeFilterNumber(mixInput(nodeId, "0.1V/Oct"), null), -10, 10)
+          : referenceVoltage;
+        const frequencyHz = Math.max(0, baseFrequency * (2 ** ((pitchInput - referenceVoltage) / 0.1)));
         value = this.surgeOscillatorSample(state, {
           frequencyHz,
           sampleRate: this.engineSampleRate || sampleRate,
@@ -7554,9 +7772,18 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
         // keyboard is automatically in tune; double it to transpose the
         // whole instrument up an octave.
         const baseFrequency = Math.max(0, read("frequency", 100));
-        const pitchInput = this.clampValue(this.safeFilterNumber(mixInput(nodeId, "0.1V/Oct"), null), -1, 1);
         const referenceMidiNote = Number.isFinite(this.pitchReferenceMidiNote) ? this.pitchReferenceMidiNote : 48;
         const referenceVoltage = referenceMidiNote / 120;
+        // With nothing patched into 0.1V/Oct, the module should just sound at
+        // "frequency" -- i.e. as if it's always playing the reference note --
+        // not silently transposed down by however many octaves the reference
+        // note happens to sit at. Only pull from the CV input when something
+        // is actually connected; otherwise treat pitchInput as if it WERE the
+        // reference voltage, so (pitchInput - referenceVoltage) cancels to 0.
+        const hasPitchInput = this.inputConnections.has(this.inputKey(nodeId, "0.1V/Oct"));
+        const pitchInput = hasPitchInput
+          ? this.clampValue(this.safeFilterNumber(mixInput(nodeId, "0.1V/Oct"), null), -1, 1)
+          : referenceVoltage;
         const pitchedFrequency = Math.max(0, baseFrequency * (2 ** ((pitchInput - referenceVoltage) / 0.1)));
         value = this.robinSupersawSample(state, {
           frequencyHz: pitchedFrequency,
@@ -7564,6 +7791,30 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
           detuneCents: read("detuneCents", 30),
           voices: read("voices", 7),
           level: read("level", 1),
+        });
+      } else if (node?.type === "hypersaw") {
+        const state = this.hypersawStates.get(nodeId) || this.createHypersawState();
+        this.hypersawStates.set(nodeId, state);
+        const read = (key, fallback) => this.readEffectiveParameter(node, key, fallback, frame, frames, frameValues);
+        // baseFrequency is the pitch heard at the global pitch reference
+        // note -- same convention as RobinSupersaw above.
+        const baseFrequency = Math.max(0, read("frequency", 100));
+        const referenceMidiNote = Number.isFinite(this.pitchReferenceMidiNote) ? this.pitchReferenceMidiNote : 48;
+        const referenceVoltage = referenceMidiNote / 120;
+        const hasPitchInput = this.inputConnections.has(this.inputKey(nodeId, "0.1V/Oct"));
+        const pitchInput = hasPitchInput
+          ? this.clampValue(this.safeFilterNumber(mixInput(nodeId, "0.1V/Oct"), null), -1, 1)
+          : referenceVoltage;
+        const pitchedFrequency = Math.max(0, baseFrequency * (2 ** ((pitchInput - referenceVoltage) / 0.1)));
+        value = this.hypersawSample(state, {
+          frequencyHz: pitchedFrequency,
+          sampleRate: this.engineSampleRate || sampleRate,
+          phaseOffset: read("phase", 0),
+          numVoices: read("voices", 8),
+          spread: read("spread", 1),
+          randomAmount: read("random", 0.15),
+          driftAmount: read("drift", 0.1),
+          level: read("level", 0.35),
         });
       } else if (node?.type === "midiOut") {
         const hasMidiInput = this.inputConnections.has(this.inputKey(nodeId, "MIDI Number"));
