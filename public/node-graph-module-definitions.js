@@ -820,7 +820,11 @@ const nodeGraphModuleDefinitions = Object.freeze({
     // in this sandbox), as is "vibRate" (the original exposes vibAmp_/
     // vibOffset_ but not vibOsc_'s own rate).
     parameters: [
-      { key: "numOscillators", label: "Num Oscillators", defaultValue: "8", min: "1", mid: "8", max: "64", step: "1" },
+      // Fractional, not integer-stepped: the "next" voice above
+      // floor(numOscillators) fades in/out continuously as this value
+      // crosses its index (voice i's gain is clamp(numOscillators-i,0,1)),
+      // instead of voices switching on/off at whole-number boundaries.
+      { key: "numOscillators", label: "Num Oscillators", defaultValue: "8", min: "1", mid: "8", max: "64", step: "any" },
       { key: "phase", label: "Phase", kind: "phase", defaultValue: "0", min: "0", mid: "0.5", max: "1", step: "0.01", unit: "cycle", wraparound: true },
       { key: "frequency", label: "Frequency", kind: "frequency", defaultValue: "100", min: "0", mid: "220", max: "20000", step: "any", unit: "Hz" },
       { key: "distributePhaseAmp", label: "Distribute Phase Amp", defaultValue: "1", min: "0", mid: "0.5", max: "1", step: "0.01" },

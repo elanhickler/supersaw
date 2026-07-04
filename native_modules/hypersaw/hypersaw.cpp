@@ -89,24 +89,17 @@
 // own centerSideCrossfade_/velocity_/portamento system is out of scope
 // here -- this port covers the phase-dispersion circuit only.)
 //
-// Changing numOscillators live (this sandbox lets it be automated, unlike
-// the original where it's normally a fixed preset choice) needs its own
-// click-prevention, inspired by two things the original DOES do when its
-// own numOscillators_ changes: (1) newly-activated voices' envelopes
-// call `env_.transferState(oscArray_[0].env_)`, which continues from
-// wherever voice 0's *smooth, exponential* envelope curve currently sits
-// rather than jumping straight to full volume; deactivated voices'
-// envelopes are simply excluded from the mix once idle. (2) every active
-// voice's `div_` (i/numOscillators) is reassigned on every change. Ported
-// as: each voice has its own smooth activeGain (envelope-style one-pole
-// ramp toward 1 if within the requested count, toward 0 otherwise,
-// instead of the original's real ADSR -- this port has no note
-// envelope system to reuse) so voices fade in/out instead of switching
-// instantly, and `div` uses a similarly smoothed (not instantaneous)
-// oscillator count so *already-active* voices don't jump position the
-// moment the total changes. Both channels normalize by the sum of active
-// gains (not a raw integer count) so loudness stays continuous through
-// the transition too.
+// numOscillators is a genuinely fluid (fractional) value here, not
+// rounded to an integer: voice i's gain is clamp(numOscillators - i, 0,
+// 1), so with numOscillators = 4.7, voices 0-3 sit at full gain and
+// voice 4 (the "next" one) sits at 0.7 -- a direct function of the
+// slider's current position, not a time-based ramp. `div` (i /
+// numOscillators) likewise uses the raw fractional value, so it varies
+// continuously as numOscillators moves rather than snapping between
+// integers. This eliminates the click at its source instead of masking
+// it with a smoother: a small change in numOscillators only ever
+// produces a small change in one voice's gain and everyone's div,
+// because the function producing them is itself continuous.
 
 namespace {
 
@@ -187,17 +180,13 @@ struct HypersawVoiceState {
   double randomOffset;   // randomPhaseOffset_: fixed per-voice random value, set at seed/reset
   double driftOut;       // drift_'s out_: the raw, hard-clamped random-walk accumulator
   double driftFilterState;  // drift_'s lpf_ output state (buf_[1])
-  double activeGain;     // smooth 0..1 ramp toward "is this voice within numOscillators"
   unsigned int rngState;
 };
 
 struct HypersawState {
   bool active;
-  bool countsInitialized;
   HypersawVoiceState voices[kMaxVoices];
   double vibPhase;  // vibOsc_'s shared running phase accumulator, 0..1
-  double smoothedNumOscillators;  // one-pole-smoothed numOscillators, used for div's denominator
-  int activeUpperBound;  // loop bound: max(requested count, still-fading-out voices)
   double outLeft;
   double outRight;
 };
@@ -209,7 +198,6 @@ void resetVoice(HypersawVoiceState& voice) {
   voice.randomOffset = randomBipolarUnit(voice.rngState);
   voice.driftOut = 0.0;
   voice.driftFilterState = 0.0;
-  voice.activeGain = 0.0;
 }
 
 void seedVoice(HypersawVoiceState& voice, int instanceIndex, int voiceIndex) {
@@ -256,7 +244,9 @@ extern "C" void soemdsp_hypersaw_reset(int handle) {
 // phaseOffset: global phase control (0..1), added to every voice alike
 //   (this port's own addition, matching every other oscillator module in
 //   this sandbox -- not part of Hypersaw.hpp).
-// numOscillators: 1..kMaxVoices sawtooths in the bank (numOscillators_).
+// numOscillators: 1..kMaxVoices, fractional (numOscillators_) -- voice i's
+//   gain is clamp(numOscillators - i, 0, 1), so the "next" voice fades in
+//   smoothly as this value crosses its index instead of switching on/off.
 // distributePhaseAmp: 0..1, scales each voice's fixed even phase position
 //   (div_ = i/numOscillators) (distributePhaseAmp_).
 // randomPhaseAmp: 0..1, scales each voice's fixed random phase offset
@@ -281,7 +271,7 @@ extern "C" void soemdsp_hypersaw_sample(
   double frequencyHz,
   double sampleRate,
   double phaseOffset,
-  int numOscillators,
+  double numOscillators,
   double distributePhaseAmp,
   double randomPhaseAmp,
   double driftAmp,
@@ -297,7 +287,11 @@ extern "C" void soemdsp_hypersaw_sample(
 
   const double safeSampleRate = sampleRate > 1.0 ? sampleRate : 48000.0;
   const double safeFrequency = frequencyHz > 0.0 ? frequencyHz : 0.0;
-  const int voiceCount = numOscillators < 1 ? 1 : (numOscillators > kMaxVoices ? kMaxVoices : numOscillators);
+  const double voiceCountFloat = clampD(numOscillators, 1.0, static_cast<double>(kMaxVoices));
+  // Voice i's gain is clamp(voiceCountFloat - i, 0, 1) -- floor(voiceCountFloat)
+  // voices at full gain, one voice fading in/out at the fractional edge.
+  // Loop up to ceil(voiceCountFloat) to include that fading voice.
+  const int voiceLoopCount = static_cast<int>(__builtin_ceil(voiceCountFloat));
   const double distributeAmt = clampD(distributePhaseAmp, 0.0, 1.0);
   const double randomAmt = clampD(randomPhaseAmp, 0.0, 1.0);
   const double driftAmt = clampD(driftAmp, 0.0, 1.0);
@@ -333,32 +327,19 @@ extern "C" void soemdsp_hypersaw_sample(
   s.vibPhase = wrap01(s.vibPhase + vibRate / safeSampleRate);
   const double vibSample = fastSine01(s.vibPhase + 0.5);
 
-  // First-ever call: snap straight to the requested count (no unwanted
-  // fade-in delay when a sound starts) -- see file header comment for
-  // why later CHANGES to numOscillators are smoothed instead.
-  if (!s.countsInitialized) {
-    s.smoothedNumOscillators = static_cast<double>(voiceCount);
-    s.activeUpperBound = voiceCount;
-    for (int v = 0; v < voiceCount; v++) s.voices[v].activeGain = 1.0;
-    s.countsInitialized = true;
-  }
-  if (voiceCount > s.activeUpperBound) s.activeUpperBound = voiceCount;
-
-  const double countSmoothCoeff = 1.0 - expApprox(-1.0 / (0.02 * safeSampleRate));   // ~20ms
-  s.smoothedNumOscillators += (static_cast<double>(voiceCount) - s.smoothedNumOscillators) * countSmoothCoeff;
-  const double smoothedCount = s.smoothedNumOscillators > 1.0 ? s.smoothedNumOscillators : 1.0;
-  const double gainSmoothCoeff = 1.0 - expApprox(-1.0 / (0.01 * safeSampleRate));    // ~10ms
+  // Center/side routing parity uses the rounded voice count -- this only
+  // ever affects which channel the partially-faded edge voice routes to,
+  // a cosmetic detail next to the gain fade itself.
+  const bool voiceCountIsEven = (static_cast<int>(voiceCountFloat + 0.5) % 2) == 0;
 
   double leftSum = 0.0, rightSum = 0.0;
   double leftGainSum = 0.0, rightGainSum = 0.0;
 
-  for (int i = 0; i < s.activeUpperBound; i++) {
+  for (int i = 0; i < voiceLoopCount; i++) {
     HypersawVoiceState& voice = s.voices[i];
 
-    const double gainTarget = (i < voiceCount) ? 1.0 : 0.0;
-    voice.activeGain += (gainTarget - voice.activeGain) * gainSmoothCoeff;
-
-    const double div = static_cast<double>(i) / smoothedCount;
+    const double gain = clampD(voiceCountFloat - static_cast<double>(i), 0.0, 1.0);
+    const double div = static_cast<double>(i) / voiceCountFloat;
 
     double walkOut = 0.0;
     if (driftAmt > 0.0) {
@@ -379,28 +360,23 @@ extern "C" void soemdsp_hypersaw_sample(
 
     const double renderPhase = wrap01(voice.phase + phaseOffset + dispersion);
     // PolyBLEP::saw(): 1 - 2*t + blep(t, dt) -- a descending ramp.
-    const double sawSample = (1.0 - 2.0 * renderPhase + polyBlep(renderPhase, phaseIncrement > 0.0 ? phaseIncrement : 1.0)) * voice.activeGain;
+    const double sawSample = (1.0 - 2.0 * renderPhase + polyBlep(renderPhase, phaseIncrement > 0.0 ? phaseIncrement : 1.0)) * gain;
 
     voice.phase = wrap01(voice.phase + phaseIncrement);
 
-    const bool isCenter = (i == 0) || (i == 1 && (voiceCount % 2 == 0));
+    const bool isCenter = (i == 0) || (i == 1 && voiceCountIsEven);
     if (isCenter) {
       leftSum += sawSample;
       rightSum += sawSample;
-      leftGainSum += voice.activeGain;
-      rightGainSum += voice.activeGain;
+      leftGainSum += gain;
+      rightGainSum += gain;
     } else if ((i % 2) == 0) {
       leftSum += sawSample;
-      leftGainSum += voice.activeGain;
+      leftGainSum += gain;
     } else {
       rightSum += sawSample;
-      rightGainSum += voice.activeGain;
+      rightGainSum += gain;
     }
-  }
-
-  // Shrink the loop bound once fully-faded voices no longer need advancing.
-  while (s.activeUpperBound > voiceCount && s.voices[s.activeUpperBound - 1].activeGain < 0.0005) {
-    s.activeUpperBound--;
   }
 
   double left = leftGainSum > 0.0001 ? leftSum / leftGainSum : 0.0;
@@ -428,5 +404,5 @@ extern "C" int soemdsp_hypersaw_max_voices() {
 }
 
 extern "C" int soemdsp_hypersaw_version() {
-  return 4;
+  return 5;
 }
