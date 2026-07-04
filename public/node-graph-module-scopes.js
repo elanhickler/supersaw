@@ -8398,7 +8398,15 @@ function nodeGraphModuleScopeScreenItems(workspace, canvas, pixelRatio) {
   const slotDebug = [];
   const items = nodeGraphVisibleModuleScopeSlots()
     .map((slot) => {
-      const buffer = nodeGraphModuleScopeDisplayBuffer(
+      // hypersawBurn reads directly from nodeGraphModuleScopeState.hypersawVoicePhases
+      // (a plain snapshot, not the generic capture-buffer pipeline) --
+      // never gate/clear it on buffer availability like the other
+      // renderers below, or every transient gap in the unrelated "Left"
+      // scalar capture (e.g. during a param drag) blanks the display for
+      // a frame, which reads as blinking. Otherwise reuses the exact same
+      // geometry computation as the buffered path below.
+      const isHypersawBurn = nodeGraphModuleDisplayRendererForSlot(slot) === "hypersawBurn";
+      const buffer = isHypersawBurn ? [] : nodeGraphModuleScopeDisplayBuffer(
         slot,
         nodeGraphModuleScopeCapturedBufferForSlot(slot),
       );
