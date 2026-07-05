@@ -815,27 +815,55 @@ const nodeGraphModuleDefinitions = Object.freeze({
     // Parameter names below match soundemote's own HypersawUnit/
     // HypersawMaster (docs/reference/Hypersaw.hpp) exactly, plus the
     // remaining core dispersion/mix parameters the actual shipped
-    // SoEmHypersaw VST exposes for this circuit (waveform, morph,
-    // driftStyle, centerSideCrossfade, monoStereo -- see
+    // SoEmHypersaw VST exposes for this circuit -- see
     // native_modules/hypersaw/hypersaw.cpp's header comment for exactly
-    // where each one comes from and what's deliberately left out:
-    // polyphony, envelope, portamento, velocity, tape emulation, pitch
+    // where each one comes from and what's deliberately left out
+    // (polyphony, envelope, portamento, velocity, tape emulation, pitch
     // wheel -- all voice-manager concerns of that plugin, not Hypersaw's
-    // own circuit). "frequency", "phase", and "level" are this port's own
-    // additions (matching every other oscillator module in this
-    // sandbox), as is "vibRate" (the original exposes vibAmp_/vibOffset_
-    // but not vibOsc_'s own rate).
+    // own circuit).
+    //
+    // Ranges/defaults below are transcribed directly from that VST's own
+    // ParameterIdx table (SoEmHypersaw.cpp's `pars_` initializer -- each
+    // entry is `Par{name, min, max, default, unit}` in real units, not
+    // normalized 0..1):
+    //   Oscillators        1     64    32
+    //   Waveform           0     13    8   (14 shapes; this port only
+    //                                       implements 6 -- see below)
+    //   Morph              0     1     1
+    //   DistributePhase    0     1     0
+    //   RandomizePhase     0     1     0
+    //   VibratoAmp         0     32    0
+    //   VibratoOffset      0     32    6.263  (renamed "MultiplyPhase"
+    //                                          internally in that file)
+    //   VibratoSpeed       0     100   0     hz
+    //   DriftStyle         1     3     2     (1=Filtered Noise,
+    //                                         2=Random Steps [default],
+    //                                         3=Fixed Steps)
+    //   DriftAmp           0     100   22.6
+    //   DriftJitter        0.001 1000  246.001 hz
+    //   CenterSide         0     1     0.5
+    //   MonoStereo         0     1     1
+    //   Volume             0     1     0.5   (this port's "level")
+    // "frequency", "phase", and "driftFrequency" are this port's own
+    // additions -- driftFrequency in particular replaces the original's
+    // pitch-tracked DriftPitch/DriftCompensation system (a note-pitch-
+    // relative lowpass cutoff) with a plain, direct Hz knob, since this
+    // port has no single "voice pitch" concept to track against; its
+    // range/default are this port's own judgment call, not transcribed.
     parameters: [
       // Fractional, not integer-stepped: the "next" voice above
       // floor(numOscillators) fades in/out continuously as this value
       // crosses its index (voice i's gain is clamp(numOscillators-i,0,1)),
       // instead of voices switching on/off at whole-number boundaries.
-      { key: "numOscillators", label: "Num Oscillators", defaultValue: "8", min: "1", mid: "8", max: "64", step: "any" },
+      { key: "numOscillators", label: "Num Oscillators", defaultValue: "32", min: "1", mid: "32", max: "64", step: "any" },
       { key: "phase", label: "Phase", kind: "phase", defaultValue: "0", min: "0", mid: "0.5", max: "1", step: "0.01", unit: "cycle", wraparound: true },
       { key: "frequency", label: "Frequency", kind: "frequency", defaultValue: "100", min: "0", mid: "220", max: "20000", step: "any", unit: "Hz" },
+      // Original's default (index 8 in PolyBLEP::Shape's real enum
+      // order) is Tri -- this port's 6-shape subset re-orders the
+      // choices, so Tri sits at index 2 here instead.
       {
         choices: ["Sin", "Square", "Tri", "Saw", "Ramp", "SawSquare"],
-        defaultValue: "3",
+        defaultValue: "2",
         displayChoices: true,
         divideChoicesVisibly: true,
         key: "waveform",
@@ -850,12 +878,16 @@ const nodeGraphModuleDefinitions = Object.freeze({
       // Only affects SawSquare -- the other shapes don't take a morph
       // argument in the original either.
       { key: "morph", label: "Morph", defaultValue: "1", min: "0", mid: "0.5", max: "1", step: "0.01" },
-      { key: "distributePhaseAmp", label: "Distribute Phase Amp", defaultValue: "1", min: "0", mid: "0.5", max: "1", step: "0.01" },
-      { key: "randomPhaseAmp", label: "Random Phase Amp", defaultValue: "0.15", min: "0", mid: "0.5", max: "1", step: "0.01" },
-      { key: "driftAmp", label: "Drift Amp", defaultValue: "0.1", min: "0", mid: "0.5", max: "1", step: "0.01" },
+      { key: "distributePhaseAmp", label: "Distribute Phase Amp", defaultValue: "0", min: "0", mid: "0.5", max: "1", step: "0.01" },
+      { key: "randomPhaseAmp", label: "Random Phase Amp", defaultValue: "0", min: "0", mid: "0.5", max: "1", step: "0.01" },
+      { key: "driftAmp", label: "Drift Amp", defaultValue: "22.6", min: "0", mid: "50", max: "100", step: "any" },
+      // Original's default is "Random Steps" (index 1 here), not "Fixed
+      // Steps" -- this port defaulted to Fixed Steps until now (it was
+      // the only mode implemented), so this default is now a real change
+      // in behavior for existing patches.
       {
         choices: ["Filtered Noise", "Random Steps", "Fixed Steps"],
-        defaultValue: "2",
+        defaultValue: "1",
         displayChoices: true,
         divideChoicesVisibly: true,
         key: "driftStyle",
@@ -867,13 +899,13 @@ const nodeGraphModuleDefinitions = Object.freeze({
         step: "1",
       },
       { key: "driftFrequency", label: "Drift Frequency", kind: "frequency", defaultValue: "2", min: "0.01", mid: "2", max: "20", step: "any", unit: "Hz" },
-      { key: "driftJitter", label: "Drift Jitter", kind: "frequency", defaultValue: "2", min: "0", mid: "2", max: "20", step: "any", unit: "Hz" },
-      { key: "vibAmp", label: "Vib Amp", defaultValue: "0", min: "0", mid: "0.5", max: "2", step: "0.01" },
-      { key: "vibOffset", label: "Vib Offset", defaultValue: "0", min: "-1", mid: "0", max: "1", step: "0.01" },
-      { key: "vibRate", label: "Vib Rate", kind: "frequency", defaultValue: "5", min: "0.01", mid: "5", max: "20", step: "any", unit: "Hz" },
+      { key: "driftJitter", label: "Drift Jitter", kind: "frequency", defaultValue: "246.001", min: "0.001", mid: "22", max: "1000", step: "any", unit: "Hz" },
+      { key: "vibAmp", label: "Vib Amp", defaultValue: "0", min: "0", mid: "16", max: "32", step: "0.01" },
+      { key: "vibOffset", label: "Vib Offset", defaultValue: "6.263", min: "0", mid: "16", max: "32", step: "0.01" },
+      { key: "vibRate", label: "Vib Rate", kind: "frequency", defaultValue: "0", min: "0", mid: "50", max: "100", step: "any", unit: "Hz" },
       { key: "centerSideCrossfade", label: "Center/Side", defaultValue: "0.5", min: "0", mid: "0.5", max: "1", step: "0.01" },
       { key: "monoStereo", label: "Mono/Stereo", defaultValue: "1", min: "0", mid: "0.5", max: "1", step: "0.01" },
-      { key: "level", label: "Amplitude", defaultValue: "0.35", min: "0", mid: "0.5", max: "1", step: "0.01" },
+      { key: "level", label: "Amplitude", defaultValue: "0.5", min: "0", mid: "0.5", max: "1", step: "0.01" },
     ],
   },
   noiseGenerator: {

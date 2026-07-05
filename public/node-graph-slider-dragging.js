@@ -384,6 +384,13 @@ function beginNodeSliderDrag(event) {
   if (!slider) {
     return;
   }
+  // Belt-and-suspenders: attachNodeSliderReadoutEvents never wires this
+  // handler onto a number-only readout in the first place, but keep the
+  // invariant explicit here too since this function is the one place that
+  // actually starts a drag.
+  if (slider.dataset.control === "number") {
+    return;
+  }
 
   const lane = nodeSliderVisualLane(surface, slider);
   const resetToDefaultOnClick = (event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey;

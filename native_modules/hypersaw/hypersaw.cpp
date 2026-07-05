@@ -323,10 +323,10 @@ extern "C" void soemdsp_hypersaw_sample(
   const int voiceLoopCount = static_cast<int>(__builtin_ceil(voiceCountFloat));
   const double distributeAmt = clampD(distributePhaseAmp, 0.0, 1.0);
   const double randomAmt = clampD(randomPhaseAmp, 0.0, 1.0);
-  const double driftAmt = clampD(driftAmp, 0.0, 1.0);
+  const double driftAmt = clampD(driftAmp, 0.0, 100.0);
   const double safeDriftFrequency = driftFrequency > 0.0 ? driftFrequency : 0.0;
   const double safeDriftJitter = driftJitter > 0.0 ? driftJitter : 0.0;
-  const double vibAmt = clampD(vibAmp, 0.0, 2.0);
+  const double vibAmt = clampD(vibAmp, 0.0, 32.0);
   const double vibOffsetAmt = vibOffset;
   const double phaseIncrement = safeFrequency / safeSampleRate;
   const double morphAmt = clampD(morph, 0.0, 1.0);
@@ -445,5 +445,5 @@ extern "C" int soemdsp_hypersaw_max_voices() {
 }
 
 extern "C" int soemdsp_hypersaw_version() {
-  return 7;
+  return 8;
 }

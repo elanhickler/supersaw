@@ -6918,10 +6918,10 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
     const voiceLoopCount = Math.ceil(voiceCountFloat);
     const distributeAmt = this.clampValue(Number(options.distributePhaseAmp) || 0, 0, 1);
     const randomAmt = this.clampValue(Number(options.randomPhaseAmp) || 0, 0, 1);
-    const driftAmt = this.clampValue(Number(options.driftAmp) || 0, 0, 1);
+    const driftAmt = this.clampValue(Number(options.driftAmp) || 0, 0, 100);
     const safeDriftFrequency = Math.max(0, Number(options.driftFrequency) || 0);
     const safeDriftJitter = Math.max(0, Number(options.driftJitter) || 0);
-    const vibAmt = this.clampValue(Number(options.vibAmp) || 0, 0, 2);
+    const vibAmt = this.clampValue(Number(options.vibAmp) || 0, 0, 32);
     const vibOffsetAmt = Number(options.vibOffset) || 0;
     const vibRate = Number(options.vibRate) || 0;
     const waveform = Math.round(Number(options.waveform) || 0);
@@ -7990,21 +7990,21 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
           frequencyHz: pitchedFrequency,
           sampleRate: this.engineSampleRate || sampleRate,
           phaseOffset: read("phase", 0),
-          numOscillators: read("numOscillators", 8),
-          distributePhaseAmp: read("distributePhaseAmp", 1),
-          randomPhaseAmp: read("randomPhaseAmp", 0.15),
-          driftAmp: read("driftAmp", 0.1),
+          numOscillators: read("numOscillators", 32),
+          distributePhaseAmp: read("distributePhaseAmp", 0),
+          randomPhaseAmp: read("randomPhaseAmp", 0),
+          driftAmp: read("driftAmp", 22.6),
           driftFrequency: read("driftFrequency", 2),
-          driftJitter: read("driftJitter", 0.3),
+          driftJitter: read("driftJitter", 246.001),
           vibAmp: read("vibAmp", 0),
-          vibOffset: read("vibOffset", 0),
-          vibRate: read("vibRate", 5),
-          waveform: read("waveform", 3),
+          vibOffset: read("vibOffset", 6.263),
+          vibRate: read("vibRate", 0),
+          waveform: read("waveform", 2),
           morph: read("morph", 1),
-          driftStyle: read("driftStyle", 2),
+          driftStyle: read("driftStyle", 1),
           centerSideCrossfade: read("centerSideCrossfade", 0.5),
           monoStereo: read("monoStereo", 1),
-          level: read("level", 0.35),
+          level: read("level", 0.5),
         });
       } else if (node?.type === "midiOut") {
         const hasMidiInput = this.inputConnections.has(this.inputKey(nodeId, "MIDI Number"));

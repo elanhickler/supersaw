@@ -138,8 +138,8 @@ function createNodeGraphHypersawState() {
 }
 
 // options: { frequencyHz, sampleRate, phaseOffset (0..1), numOscillators (1..64),
-//   distributePhaseAmp (0..1), randomPhaseAmp (0..1), driftAmp (0..1),
-//   driftFrequency (Hz), driftJitter (Hz), vibAmp (0..2), vibOffset,
+//   distributePhaseAmp (0..1), randomPhaseAmp (0..1), driftAmp (0..100),
+//   driftFrequency (Hz), driftJitter (Hz), vibAmp (0..32), vibOffset,
 //   vibRate (Hz), waveform (0..5), morph (0..1), driftStyle (0..2),
 //   centerSideCrossfade (0..1), monoStereo (0..1), level }
 // returns: { Left, Right, voicePhases: number[] }
@@ -151,10 +151,10 @@ function nodeGraphHypersawSample(state, options = {}) {
   const voiceLoopCount = Math.ceil(voiceCountFloat);
   const distributeAmt = clampNodeSliderValue(Number(options.distributePhaseAmp) || 0, 0, 1);
   const randomAmt = clampNodeSliderValue(Number(options.randomPhaseAmp) || 0, 0, 1);
-  const driftAmt = clampNodeSliderValue(Number(options.driftAmp) || 0, 0, 1);
+  const driftAmt = clampNodeSliderValue(Number(options.driftAmp) || 0, 0, 100);
   const safeDriftFrequency = Math.max(0, Number(options.driftFrequency) || 0);
   const safeDriftJitter = Math.max(0, Number(options.driftJitter) || 0);
-  const vibAmt = clampNodeSliderValue(Number(options.vibAmp) || 0, 0, 2);
+  const vibAmt = clampNodeSliderValue(Number(options.vibAmp) || 0, 0, 32);
   const vibOffsetAmt = Number(options.vibOffset) || 0;
   const vibRate = Number(options.vibRate) || 0;
   const waveform = Math.round(Number(options.waveform) || 0);
