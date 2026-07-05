@@ -813,12 +813,18 @@ const nodeGraphModuleDefinitions = Object.freeze({
     inputs: ["Reset", "0.1V/Oct"],
     outputs: ["Left", "Right"],
     // Parameter names below match soundemote's own HypersawUnit/
-    // HypersawMaster (docs/reference/Hypersaw.hpp) exactly -- see
-    // native_modules/hypersaw/hypersaw.cpp's header comment for the full
-    // formula each one plugs into. "frequency", "phase", and "level" are
-    // this port's own additions (matching every other oscillator module
-    // in this sandbox), as is "vibRate" (the original exposes vibAmp_/
-    // vibOffset_ but not vibOsc_'s own rate).
+    // HypersawMaster (docs/reference/Hypersaw.hpp) exactly, plus the
+    // remaining core dispersion/mix parameters the actual shipped
+    // SoEmHypersaw VST exposes for this circuit (waveform, morph,
+    // driftStyle, centerSideCrossfade, monoStereo -- see
+    // native_modules/hypersaw/hypersaw.cpp's header comment for exactly
+    // where each one comes from and what's deliberately left out:
+    // polyphony, envelope, portamento, velocity, tape emulation, pitch
+    // wheel -- all voice-manager concerns of that plugin, not Hypersaw's
+    // own circuit). "frequency", "phase", and "level" are this port's own
+    // additions (matching every other oscillator module in this
+    // sandbox), as is "vibRate" (the original exposes vibAmp_/vibOffset_
+    // but not vibOsc_'s own rate).
     parameters: [
       // Fractional, not integer-stepped: the "next" voice above
       // floor(numOscillators) fades in/out continuously as this value
@@ -827,14 +833,46 @@ const nodeGraphModuleDefinitions = Object.freeze({
       { key: "numOscillators", label: "Num Oscillators", defaultValue: "8", min: "1", mid: "8", max: "64", step: "any" },
       { key: "phase", label: "Phase", kind: "phase", defaultValue: "0", min: "0", mid: "0.5", max: "1", step: "0.01", unit: "cycle", wraparound: true },
       { key: "frequency", label: "Frequency", kind: "frequency", defaultValue: "100", min: "0", mid: "220", max: "20000", step: "any", unit: "Hz" },
+      {
+        choices: ["Sin", "Square", "Tri", "Saw", "Ramp", "SawSquare"],
+        defaultValue: "3",
+        displayChoices: true,
+        divideChoicesVisibly: true,
+        key: "waveform",
+        kind: "waveform",
+        label: "Waveform",
+        linearSmoothing: false,
+        max: "5",
+        mid: "2",
+        min: "0",
+        step: "1",
+      },
+      // Only affects SawSquare -- the other shapes don't take a morph
+      // argument in the original either.
+      { key: "morph", label: "Morph", defaultValue: "1", min: "0", mid: "0.5", max: "1", step: "0.01" },
       { key: "distributePhaseAmp", label: "Distribute Phase Amp", defaultValue: "1", min: "0", mid: "0.5", max: "1", step: "0.01" },
       { key: "randomPhaseAmp", label: "Random Phase Amp", defaultValue: "0.15", min: "0", mid: "0.5", max: "1", step: "0.01" },
       { key: "driftAmp", label: "Drift Amp", defaultValue: "0.1", min: "0", mid: "0.5", max: "1", step: "0.01" },
+      {
+        choices: ["Filtered Noise", "Random Steps", "Fixed Steps"],
+        defaultValue: "2",
+        displayChoices: true,
+        divideChoicesVisibly: true,
+        key: "driftStyle",
+        label: "Drift Style",
+        linearSmoothing: false,
+        max: "2",
+        mid: "1",
+        min: "0",
+        step: "1",
+      },
       { key: "driftFrequency", label: "Drift Frequency", kind: "frequency", defaultValue: "2", min: "0.01", mid: "2", max: "20", step: "any", unit: "Hz" },
       { key: "driftJitter", label: "Drift Jitter", kind: "frequency", defaultValue: "2", min: "0", mid: "2", max: "20", step: "any", unit: "Hz" },
       { key: "vibAmp", label: "Vib Amp", defaultValue: "0", min: "0", mid: "0.5", max: "2", step: "0.01" },
       { key: "vibOffset", label: "Vib Offset", defaultValue: "0", min: "-1", mid: "0", max: "1", step: "0.01" },
       { key: "vibRate", label: "Vib Rate", kind: "frequency", defaultValue: "5", min: "0.01", mid: "5", max: "20", step: "any", unit: "Hz" },
+      { key: "centerSideCrossfade", label: "Center/Side", defaultValue: "0.5", min: "0", mid: "0.5", max: "1", step: "0.01" },
+      { key: "monoStereo", label: "Mono/Stereo", defaultValue: "1", min: "0", mid: "0.5", max: "1", step: "0.01" },
       { key: "level", label: "Amplitude", defaultValue: "0.35", min: "0", mid: "0.5", max: "1", step: "0.01" },
     ],
   },

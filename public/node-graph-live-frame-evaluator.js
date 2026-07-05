@@ -3067,6 +3067,11 @@ function evaluateNodeGraphPlanFrame(runtime, sampleRate, frame, frames) {
         vibAmp: read("vibAmp", 0),
         vibOffset: read("vibOffset", 0),
         vibRate: read("vibRate", 5),
+        waveform: read("waveform", 3),
+        morph: read("morph", 1),
+        driftStyle: read("driftStyle", 2),
+        centerSideCrossfade: read("centerSideCrossfade", 0.5),
+        monoStereo: read("monoStereo", 1),
         level: read("level", 0.35),
       });
       value = { Left: hypersawResult.Left, Right: hypersawResult.Right };

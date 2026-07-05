@@ -1690,7 +1690,7 @@ async function createNodeGraphLiveWorkletNode(context) {
     throw new Error("AudioWorklet unavailable");
   }
   await nodeGraphLiveAwaitStartup(
-    context.audioWorklet.addModule("./public/node-live-audio-worklet.js?v=hypersaw-v10-additive-20260704"),
+    context.audioWorklet.addModule("./public/node-live-audio-worklet.js?v=hypersaw-v11-full-params-20260705"),
     "AudioWorklet startup timed out",
   );
   const workletNode = new AudioWorkletNode(

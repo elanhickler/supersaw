@@ -6797,6 +6797,20 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
     return 0;
   }
 
+  // PolyBLAMP correction term (used by Tri).
+  hypersawPolyBlamp(t, dt) {
+    if (dt <= 0) return 0;
+    if (t < dt) {
+      const x = t / dt - 1;
+      return -(1 / 3) * x * x * x;
+    }
+    if (t > 1 - dt) {
+      const x = (t - 1) / dt + 1;
+      return (1 / 3) * x * x * x;
+    }
+    return 0;
+  }
+
   hypersawWrap01(x) {
     const w = x - Math.floor(x);
     return w < 0 ? 0 : (w >= 1 ? 0 : w);
@@ -6811,6 +6825,60 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
   // curve::Rational{skew}.get(t), t already normalized 0..1.
   hypersawRationalCurve(skew, t) {
     return ((1 + skew) * t) / (1 - skew + 2 * skew * t);
+  }
+
+  // PolyBLEP.hpp::get()'s cases for the shapes SoEmHypersaw exposes via
+  // its global Waveform parameter: 0=Sin, 1=Square, 2=Tri, 3=Saw
+  // (prior/default), 4=Ramp, 5=SawSquare (the only one using morph).
+  hypersawWaveformSample(waveform, t, dt, morph) {
+    switch (waveform) {
+      case 0:
+        return this.hypersawFastSine01(t);
+      case 1: {
+        const t1 = this.hypersawWrap01(t + 0.5);
+        let y = t < 0.5 ? 1 : -1;
+        y += this.hypersawPolyBlep(t, dt) - this.hypersawPolyBlep(t1, dt);
+        return y;
+      }
+      case 2: {
+        const t1 = this.hypersawWrap01(t + 0.25);
+        const t2 = this.hypersawWrap01(t + 0.75);
+        let y = t * 4;
+        if (y >= 3) y -= 4;
+        else if (y > 1) y = 2 - y;
+        y += 4 * dt * (this.hypersawPolyBlamp(t1, dt) - this.hypersawPolyBlamp(t2, dt));
+        return y;
+      }
+      case 4: {
+        const t1 = this.hypersawWrap01(t + 0.5);
+        let y = t1 * 2 - 1;
+        y -= this.hypersawPolyBlep(t1, dt);
+        return y;
+      }
+      case 5: {
+        let y = 1 - 2 * t;
+        y += t < 0.5 ? morph : -morph;
+        y += this.hypersawPolyBlep(t, dt);
+        const tMid = this.hypersawWrap01(t - 0.5);
+        y += -morph * this.hypersawPolyBlep(tMid, dt);
+        return y;
+      }
+      case 3:
+      default:
+        return 1 - 2 * t + this.hypersawPolyBlep(t, dt);
+    }
+  }
+
+  // HypersawMaster::getCenterSideAmplitudeValue(), transcribed exactly.
+  hypersawCenterSideAmplitude(value) {
+    return { center: Math.min(2 - value * 2, 1), side: Math.min(value * 2, 1) };
+  }
+
+  // semath.cpp's real stereoWidth(), transcribed exactly.
+  hypersawStereoWidth(width, l, r) {
+    const widthInv = 1 - width;
+    const m = (l + r) * 0.5;
+    return { l: widthInv * m + width * l, r: widthInv * m + width * r };
   }
 
   createHypersawVoice() {
@@ -6856,6 +6924,11 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
     const vibAmt = this.clampValue(Number(options.vibAmp) || 0, 0, 2);
     const vibOffsetAmt = Number(options.vibOffset) || 0;
     const vibRate = Number(options.vibRate) || 0;
+    const waveform = Math.round(Number(options.waveform) || 0);
+    const morphAmt = this.clampValue(Number(options.morph) || 0, 0, 1);
+    const driftStyle = this.clampValue(Math.round(options.driftStyle ?? 2), 0, 2);
+    const centerSide = this.hypersawCenterSideAmplitude(this.clampValue(options.centerSideCrossfade ?? 0.5, 0, 1));
+    const monoStereo = this.clampValue(options.monoStereo ?? 1, 0, 1);
 
     const phaseIncrement = safeFrequency / sampleRate;
 
@@ -6888,8 +6961,9 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
     const voiceCountIsEven = Math.round(voiceCountFloat) % 2 === 0;
 
     const voicePhases = new Array(voiceLoopCount);
-    let leftSum = 0, rightSum = 0;
-    let leftGainSum = 0, rightGainSum = 0;
+    let centerSum = 0, centerGainSum = 0;
+    let sideLeftSum = 0, sideLeftGainSum = 0;
+    let sideRightSum = 0, sideRightGainSum = 0;
 
     for (let i = 0; i < voiceLoopCount; i++) {
       const voice = state.voices[i];
@@ -6900,10 +6974,17 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
       let walkOut = 0;
       if (driftAmt > 0) {
         const n = Math.random() * 2 - 1;
-        const r = n > 0 ? driftStepSize : -driftStepSize;
-        voice.driftOut = this.clampValue(voice.driftOut + r, -1, 1);
-        const raw = voice.driftOut * driftRandomMix + n * driftWhiteNoiseMix;
-        voice.driftFilterState = driftB0 * raw + driftA1 * voice.driftFilterState;
+        if (driftStyle === 0) {
+          // Filtered Noise: lpf of raw white noise, no accumulator at all.
+          voice.driftFilterState = driftB0 * n + driftA1 * voice.driftFilterState;
+        } else {
+          // Random Steps: step size proportional to n. Fixed Steps: step
+          // size is a constant magnitude, direction = sign(n).
+          const r = driftStyle === 1 ? n * driftStepSize : (n > 0 ? driftStepSize : -driftStepSize);
+          voice.driftOut = this.clampValue(voice.driftOut + r, -1, 1);
+          const raw = voice.driftOut * driftRandomMix + n * driftWhiteNoiseMix;
+          voice.driftFilterState = driftB0 * raw + driftA1 * voice.driftFilterState;
+        }
         walkOut = voice.driftFilterState * driftAmt;
       }
 
@@ -6912,34 +6993,37 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
       const dispersion = div * distributeAmt + div * vibratoOut + voice.randomOffset * randomAmt + walkOut;
 
       const renderPhase = this.hypersawWrap01(voice.phase + phaseOffset + dispersion);
-      // PolyBLEP::saw(): 1 - 2*t + blep(t, dt) -- a descending ramp.
-      const sawSample = (1 - 2 * renderPhase + this.hypersawPolyBlep(renderPhase, phaseIncrement > 0 ? phaseIncrement : 1)) * gain;
+      const sample = this.hypersawWaveformSample(waveform, renderPhase, phaseIncrement > 0 ? phaseIncrement : 1, morphAmt) * gain;
 
       voicePhases[i] = this.hypersawWrap01(dispersion);
       voice.phase = this.hypersawWrap01(voice.phase + phaseIncrement);
 
       const isCenter = i === 0 || (i === 1 && voiceCountIsEven);
       if (isCenter) {
-        leftSum += sawSample;
-        rightSum += sawSample;
-        leftGainSum += gain;
-        rightGainSum += gain;
+        centerSum += sample;
+        centerGainSum += gain;
       } else if (i % 2 === 0) {
-        leftSum += sawSample;
-        leftGainSum += gain;
+        sideLeftSum += sample;
+        sideLeftGainSum += gain;
       } else {
-        rightSum += sawSample;
-        rightGainSum += gain;
+        sideRightSum += sample;
+        sideRightGainSum += gain;
       }
     }
 
     state.lastVoicePhases = voicePhases;
 
-    let left = leftGainSum > 0.0001 ? leftSum / leftGainSum : 0;
-    let right = rightGainSum > 0.0001 ? rightSum / rightGainSum : 0;
+    const centerAvg = centerGainSum > 0.0001 ? centerSum / centerGainSum : 0;
+    const sideLeftAvg = sideLeftGainSum > 0.0001 ? sideLeftSum / sideLeftGainSum : 0;
+    const sideRightAvg = sideRightGainSum > 0.0001 ? sideRightSum / sideRightGainSum : 0;
+
+    let left = centerAvg * centerSide.center + sideLeftAvg * centerSide.side;
+    let right = centerAvg * centerSide.center + sideRightAvg * centerSide.side;
     if (!Number.isFinite(left)) left = 0;
     if (!Number.isFinite(right)) right = 0;
-    return { left, right };
+
+    const widened = this.hypersawStereoWidth(monoStereo, left, right);
+    return { left: widened.l, right: widened.r };
   }
 
   hypersawSampleJs(state, options = {}) {
@@ -6971,6 +7055,11 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
           const vibAmp = Number(options.vibAmp) || 0;
           const vibOffset = Number(options.vibOffset) || 0;
           const vibRate = Number(options.vibRate) || 0;
+          const waveform = Math.round(Number(options.waveform) || 0);
+          const morph = Number(options.morph) || 0;
+          const driftStyle = Math.round(options.driftStyle ?? 2);
+          const centerSideCrossfade = options.centerSideCrossfade ?? 0.5;
+          const monoStereo = options.monoStereo ?? 1;
           const level = Number(options.level) || 0;
           this.nativeHypersaw.soemdsp_hypersaw_sample(
             state.nativeHandle,
@@ -6986,6 +7075,11 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
             vibAmp,
             vibOffset,
             vibRate,
+            waveform,
+            morph,
+            driftStyle,
+            centerSideCrossfade,
+            monoStereo,
             level,
           );
           // Native owns the real audio-critical voice state opaquely (no
@@ -7905,6 +7999,11 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
           vibAmp: read("vibAmp", 0),
           vibOffset: read("vibOffset", 0),
           vibRate: read("vibRate", 5),
+          waveform: read("waveform", 3),
+          morph: read("morph", 1),
+          driftStyle: read("driftStyle", 2),
+          centerSideCrossfade: read("centerSideCrossfade", 0.5),
+          monoStereo: read("monoStereo", 1),
           level: read("level", 0.35),
         });
       } else if (node?.type === "midiOut") {

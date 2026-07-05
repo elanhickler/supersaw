@@ -1,40 +1,21 @@
 // Shared offline JS mirror of native_modules/hypersaw -- see that file's
-// header comment for the full derivation, cross-checked against the real
-// soemdsp library headers (Wire.hpp, SampleRate.hpp,
-// random/FlexibleRandomWalk.hpp, filter/OnePoleFilter.hpp,
-// random/NoiseGenerator.hpp, utility/curve_functions.hpp,
-// oscillator/PolyBLEP.hpp). Every parameter name matches soundemote's
-// own HypersawUnit::run() (docs/reference/Hypersaw.hpp):
+// header comment for the full derivation and sourcing (Hypersaw.hpp,
+// the real soemdsp library headers, and the actual shipped SoEmHypersaw
+// VST's parameter list/wiring). Dispersion formula (per voice i of
+// numOscillators):
 //
 //   div        = i / numOscillators
 //   vibratoOut = vibInputForVoice * vibAmp + vibOffset   (vibInput only for voice i >= 1)
 //   walkOut    = driftAmp > 0 ? drift * driftAmp : 0
 //   dispersion = div*distributePhaseAmp + div*vibratoOut + randomOffset*randomPhaseAmp + walkOut
 //
-// The real HypersawUnit::run() has three formula variants stacked as
-// comments (an evolution, not just one line) -- the first two are fully
-// additive (every dispersion source independent), and only the last,
-// active one multiplies the whole static dispersion by
-// (vibInput*vibAmp + vibOffset), which silences distributePhaseAmp/
-// randomPhaseAmp whenever vibOffset is 0. This port uses the additive
-// form: it's the only way distributePhaseAmp/randomPhaseAmp work as
-// plain, unconditional "phase position" controls rather than being
-// gated by an unrelated vibrato setting. See hypersaw.cpp's header
-// comment for the full three-variant transcription.
+// numOscillators is fluid/fractional: voice i's gain is
+// clamp(numOscillators - i, 0, 1), not an on/off switch.
 //
-// drift_ (FlexibleRandomWalk, Method::fixed_steps) is transcribed exactly
-// from the real FlexibleRandomWalk.hpp (a fixed-magnitude, random-sign
-// step accumulator, hard-clamped to [-1,1], then lowpass-filtered mixed
-// with raw white noise) -- see hypersaw.cpp's header comment for the
-// full derivation of driftStepSize/driftRandomMix/driftWhiteNoiseMix.
-//
-// numOscillators is a genuinely fluid (fractional) value, not rounded to
-// an integer: voice i's gain is clamp(numOscillators - i, 0, 1), so with
-// numOscillators = 4.7, voices 0-3 sit at full gain and voice 4 (the
-// "next" one) sits at 0.7 -- a direct function of the slider's current
-// position, not a time-based ramp. `div` (i/numOscillators) likewise
-// uses the raw fractional value, so it varies continuously as
-// numOscillators moves rather than snapping between integers.
+// waveform/morph/driftStyle are wired GLOBALLY to every voice in the
+// original (not per-voice), matching that here. centerSideCrossfade
+// weights center vs. side voices (HypersawMaster::getCenterSideAmplitudeValue);
+// monoStereo applies semath.cpp's real stereoWidth() last.
 
 const nodeGraphHypersawMaxVoices = 64;  // matches HypersawMaster::numOscillatorsMax_
 
@@ -51,13 +32,27 @@ function nodeGraphHypersawPolyBlep(t, dt) {
   return 0;
 }
 
+// PolyBLAMP correction term (used by Tri).
+function nodeGraphHypersawPolyBlamp(t, dt) {
+  if (dt <= 0) return 0;
+  if (t < dt) {
+    const x = t / dt - 1;
+    return -(1 / 3) * x * x * x;
+  }
+  if (t > 1 - dt) {
+    const x = (t - 1) / dt + 1;
+    return (1 / 3) * x * x * x;
+  }
+  return 0;
+}
+
 function nodeGraphHypersawWrap01(x) {
   const w = x - Math.floor(x);
   return w < 0 ? 0 : (w >= 1 ? 0 : w);
 }
 
 // Cheap, smooth, periodic parabolic approximation of sin(2*pi*phase01) --
-// good enough for a sub-audio vibrato LFO.
+// used both for the Sin waveform and the vibrato LFO.
 function nodeGraphHypersawFastSine01(phase01) {
   const x = nodeGraphHypersawWrap01(phase01) - 0.5;
   return 8 * x * (0.5 - Math.abs(x));
@@ -66,6 +61,63 @@ function nodeGraphHypersawFastSine01(phase01) {
 // curve::Rational{skew}.get(t), t already normalized 0..1.
 function nodeGraphHypersawRationalCurve(skew, t) {
   return ((1 + skew) * t) / (1 - skew + 2 * skew * t);
+}
+
+// PolyBLEP.hpp::get()'s cases for the shapes SoEmHypersaw exposes via its
+// global Waveform parameter: 0=Sin, 1=Square, 2=Tri, 3=Saw (this port's
+// prior/default behavior), 4=Ramp, 5=SawSquare (the only one using morph).
+function nodeGraphHypersawWaveformSample(waveform, t, dt, morph) {
+  switch (waveform) {
+    case 0:  // Sin
+      return nodeGraphHypersawFastSine01(t);
+    case 1: {  // Square
+      const t1 = nodeGraphHypersawWrap01(t + 0.5);
+      let y = t < 0.5 ? 1 : -1;
+      y += nodeGraphHypersawPolyBlep(t, dt) - nodeGraphHypersawPolyBlep(t1, dt);
+      return y;
+    }
+    case 2: {  // Tri
+      const t1 = nodeGraphHypersawWrap01(t + 0.25);
+      const t2 = nodeGraphHypersawWrap01(t + 0.75);
+      let y = t * 4;
+      if (y >= 3) y -= 4;
+      else if (y > 1) y = 2 - y;
+      y += 4 * dt * (nodeGraphHypersawPolyBlamp(t1, dt) - nodeGraphHypersawPolyBlamp(t2, dt));
+      return y;
+    }
+    case 4: {  // Ramp
+      const t1 = nodeGraphHypersawWrap01(t + 0.5);
+      let y = t1 * 2 - 1;
+      y -= nodeGraphHypersawPolyBlep(t1, dt);
+      return y;
+    }
+    case 5: {  // SawSquare
+      let y = 1 - 2 * t;
+      y += t < 0.5 ? morph : -morph;
+      y += nodeGraphHypersawPolyBlep(t, dt);
+      const tMid = nodeGraphHypersawWrap01(t - 0.5);
+      y += -morph * nodeGraphHypersawPolyBlep(tMid, dt);
+      return y;
+    }
+    case 3:  // Saw
+    default:
+      return 1 - 2 * t + nodeGraphHypersawPolyBlep(t, dt);
+  }
+}
+
+// HypersawMaster::getCenterSideAmplitudeValue(), transcribed exactly.
+function nodeGraphHypersawCenterSideAmplitude(value) {
+  return {
+    center: Math.min(2 - value * 2, 1),
+    side: Math.min(value * 2, 1),
+  };
+}
+
+// semath.cpp's real stereoWidth(), transcribed exactly.
+function nodeGraphHypersawStereoWidth(width, l, r) {
+  const widthInv = 1 - width;
+  const m = (l + r) * 0.5;
+  return { l: widthInv * m + width * l, r: widthInv * m + width * r };
 }
 
 function nodeGraphHypersawCreateVoice() {
@@ -88,19 +140,14 @@ function createNodeGraphHypersawState() {
 // options: { frequencyHz, sampleRate, phaseOffset (0..1), numOscillators (1..64),
 //   distributePhaseAmp (0..1), randomPhaseAmp (0..1), driftAmp (0..1),
 //   driftFrequency (Hz), driftJitter (Hz), vibAmp (0..2), vibOffset,
-//   vibRate (Hz), level }
-// returns: { Left, Right, voicePhases: number[] } -- voicePhases is each
-// active voice's dispersion offset (0..1, wrapped), for the voice-position
-// display. Excludes the audio-rate phase accumulator (that's the pitch
-// itself), so all dispersion controls at their silencing values means
-// every voice sits still.
+//   vibRate (Hz), waveform (0..5), morph (0..1), driftStyle (0..2),
+//   centerSideCrossfade (0..1), monoStereo (0..1), level }
+// returns: { Left, Right, voicePhases: number[] }
 function nodeGraphHypersawSample(state, options = {}) {
   const sampleRate = Number(options.sampleRate) > 1 ? Number(options.sampleRate) : 48000;
   const safeFrequency = Number(options.frequencyHz) > 0 ? Number(options.frequencyHz) : 0;
   const phaseOffset = nodeGraphHypersawWrap01(Number(options.phaseOffset) || 0);
   const voiceCountFloat = clampNodeSliderValue(Number(options.numOscillators) || 1, 1, nodeGraphHypersawMaxVoices);
-  // Voice i's gain is clamp(voiceCountFloat - i, 0, 1) -- floor(voiceCountFloat)
-  // voices at full gain, one voice fading in/out at the fractional edge.
   const voiceLoopCount = Math.ceil(voiceCountFloat);
   const distributeAmt = clampNodeSliderValue(Number(options.distributePhaseAmp) || 0, 0, 1);
   const randomAmt = clampNodeSliderValue(Number(options.randomPhaseAmp) || 0, 0, 1);
@@ -110,6 +157,11 @@ function nodeGraphHypersawSample(state, options = {}) {
   const vibAmt = clampNodeSliderValue(Number(options.vibAmp) || 0, 0, 2);
   const vibOffsetAmt = Number(options.vibOffset) || 0;
   const vibRate = Number(options.vibRate) || 0;
+  const waveform = Math.round(Number(options.waveform) || 0);
+  const morphAmt = clampNodeSliderValue(Number(options.morph) || 0, 0, 1);
+  const driftStyle = clampNodeSliderValue(Math.round(Number(options.driftStyle) ?? 2), 0, 2);
+  const centerSide = nodeGraphHypersawCenterSideAmplitude(clampNodeSliderValue(Number(options.centerSideCrossfade) ?? 0.5, 0, 1));
+  const monoStereo = clampNodeSliderValue(Number(options.monoStereo) ?? 1, 0, 1);
   const level = Number(options.level) || 0;
 
   const phaseIncrement = safeFrequency / sampleRate;
@@ -138,13 +190,11 @@ function nodeGraphHypersawSample(state, options = {}) {
   state.vibPhase = nodeGraphHypersawWrap01(state.vibPhase + vibRate / sampleRate);
   const vibSample = nodeGraphHypersawFastSine01(state.vibPhase + 0.5);
 
-  // Center/side routing parity uses the rounded voice count -- this only
-  // ever affects which channel the partially-faded edge voice routes to,
-  // a cosmetic detail next to the gain fade itself.
   const voiceCountIsEven = Math.round(voiceCountFloat) % 2 === 0;
 
-  let leftSum = 0, rightSum = 0;
-  let leftGainSum = 0, rightGainSum = 0;
+  let centerSum = 0, centerGainSum = 0;
+  let sideLeftSum = 0, sideLeftGainSum = 0;
+  let sideRightSum = 0, sideRightGainSum = 0;
   const voicePhases = new Array(voiceLoopCount);
 
   for (let i = 0; i < voiceLoopCount; i++) {
@@ -156,10 +206,17 @@ function nodeGraphHypersawSample(state, options = {}) {
     let walkOut = 0;
     if (driftAmt > 0) {
       const n = Math.random() * 2 - 1;
-      const r = n > 0 ? driftStepSize : -driftStepSize;
-      voice.driftOut = clampNodeSliderValue(voice.driftOut + r, -1, 1);
-      const raw = voice.driftOut * driftRandomMix + n * driftWhiteNoiseMix;
-      voice.driftFilterState = driftB0 * raw + driftA1 * voice.driftFilterState;
+      if (driftStyle === 0) {
+        // Filtered Noise: lpf of raw white noise, no accumulator at all.
+        voice.driftFilterState = driftB0 * n + driftA1 * voice.driftFilterState;
+      } else {
+        // Random Steps: step size proportional to n. Fixed Steps: step
+        // size is a constant magnitude, direction = sign(n).
+        const r = driftStyle === 1 ? n * driftStepSize : (n > 0 ? driftStepSize : -driftStepSize);
+        voice.driftOut = clampNodeSliderValue(voice.driftOut + r, -1, 1);
+        const raw = voice.driftOut * driftRandomMix + n * driftWhiteNoiseMix;
+        voice.driftFilterState = driftB0 * raw + driftA1 * voice.driftFilterState;
+      }
       walkOut = voice.driftFilterState * driftAmt;
     }
 
@@ -170,33 +227,36 @@ function nodeGraphHypersawSample(state, options = {}) {
     const dispersion = div * distributeAmt + div * vibratoOut + voice.randomOffset * randomAmt + walkOut;
 
     const renderPhase = nodeGraphHypersawWrap01(voice.phase + phaseOffset + dispersion);
-    // PolyBLEP::saw(): 1 - 2*t + blep(t, dt) -- a descending ramp.
-    const sawSample = (1 - 2 * renderPhase + nodeGraphHypersawPolyBlep(renderPhase, phaseIncrement > 0 ? phaseIncrement : 1)) * gain;
+    const sample = nodeGraphHypersawWaveformSample(waveform, renderPhase, phaseIncrement > 0 ? phaseIncrement : 1, morphAmt) * gain;
 
     voicePhases[i] = nodeGraphHypersawWrap01(dispersion);
     voice.phase = nodeGraphHypersawWrap01(voice.phase + phaseIncrement);
 
     const isCenter = i === 0 || (i === 1 && voiceCountIsEven);
     if (isCenter) {
-      leftSum += sawSample;
-      rightSum += sawSample;
-      leftGainSum += gain;
-      rightGainSum += gain;
+      centerSum += sample;
+      centerGainSum += gain;
     } else if (i % 2 === 0) {
-      leftSum += sawSample;
-      leftGainSum += gain;
+      sideLeftSum += sample;
+      sideLeftGainSum += gain;
     } else {
-      rightSum += sawSample;
-      rightGainSum += gain;
+      sideRightSum += sample;
+      sideRightGainSum += gain;
     }
   }
 
-  let left = leftGainSum > 0.0001 ? leftSum / leftGainSum : 0;
-  let right = rightGainSum > 0.0001 ? rightSum / rightGainSum : 0;
+  const centerAvg = centerGainSum > 0.0001 ? centerSum / centerGainSum : 0;
+  const sideLeftAvg = sideLeftGainSum > 0.0001 ? sideLeftSum / sideLeftGainSum : 0;
+  const sideRightAvg = sideRightGainSum > 0.0001 ? sideRightSum / sideRightGainSum : 0;
+
+  let left = centerAvg * centerSide.center + sideLeftAvg * centerSide.side;
+  let right = centerAvg * centerSide.center + sideRightAvg * centerSide.side;
   if (!Number.isFinite(left)) left = 0;
   if (!Number.isFinite(right)) right = 0;
 
-  const outLeft = clampNodeSliderValue(left, -1.5, 1.5) * level;
-  const outRight = clampNodeSliderValue(right, -1.5, 1.5) * level;
+  const widened = nodeGraphHypersawStereoWidth(monoStereo, left, right);
+
+  const outLeft = clampNodeSliderValue(widened.l, -1.5, 1.5) * level;
+  const outRight = clampNodeSliderValue(widened.r, -1.5, 1.5) * level;
   return { Left: outLeft, Right: outRight, voicePhases };
 }
