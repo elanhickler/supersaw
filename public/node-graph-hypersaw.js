@@ -6,15 +6,21 @@
 // oscillator/PolyBLEP.hpp). Every parameter name matches soundemote's
 // own HypersawUnit::run() (docs/reference/Hypersaw.hpp):
 //
-//   div               = i / numOscillators
-//   staticDispersion  = div * distributePhaseAmp + randomOffset * randomPhaseAmp
-//   vibratoMultiplier = vibInputForVoice * vibAmp + vibOffset   (vibInput only for voice i >= 1)
-//   walkOut           = driftAmp > 0 ? drift * driftAmp : 0
-//   dispersion        = staticDispersion * vibratoMultiplier + walkOut
+//   div        = i / numOscillators
+//   vibratoOut = vibInputForVoice * vibAmp + vibOffset   (vibInput only for voice i >= 1)
+//   walkOut    = driftAmp > 0 ? drift * driftAmp : 0
+//   dispersion = div*distributePhaseAmp + div*vibratoOut + randomOffset*randomPhaseAmp + walkOut
 //
-// vibOffset=0 fully silences distributePhaseAmp/randomPhaseAmp regardless
-// of their own values -- that's the original's actual (multiplicative,
-// not additive) formula, not a bug.
+// The real HypersawUnit::run() has three formula variants stacked as
+// comments (an evolution, not just one line) -- the first two are fully
+// additive (every dispersion source independent), and only the last,
+// active one multiplies the whole static dispersion by
+// (vibInput*vibAmp + vibOffset), which silences distributePhaseAmp/
+// randomPhaseAmp whenever vibOffset is 0. This port uses the additive
+// form: it's the only way distributePhaseAmp/randomPhaseAmp work as
+// plain, unconditional "phase position" controls rather than being
+// gated by an unrelated vibrato setting. See hypersaw.cpp's header
+// comment for the full three-variant transcription.
 //
 // drift_ (FlexibleRandomWalk, Method::fixed_steps) is transcribed exactly
 // from the real FlexibleRandomWalk.hpp (a fixed-magnitude, random-sign
@@ -159,10 +165,9 @@ function nodeGraphHypersawSample(state, options = {}) {
 
     // vibInput_ only ever points at vibOsc_ for i >= 1.
     const vibInputForVoice = i === 0 ? 0 : vibSample;
+    const vibratoOut = vibInputForVoice * vibAmt + vibOffsetAmt;
 
-    const staticDispersion = div * distributeAmt + voice.randomOffset * randomAmt;
-    const vibratoMultiplier = vibInputForVoice * vibAmt + vibOffsetAmt;
-    const dispersion = staticDispersion * vibratoMultiplier + walkOut;
+    const dispersion = div * distributeAmt + div * vibratoOut + voice.randomOffset * randomAmt + walkOut;
 
     const renderPhase = nodeGraphHypersawWrap01(voice.phase + phaseOffset + dispersion);
     // PolyBLEP::saw(): 1 - 2*t + blep(t, dt) -- a descending ramp.

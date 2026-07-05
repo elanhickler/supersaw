@@ -13,27 +13,42 @@
 // filter/OnePoleFilter.hpp, random/NoiseGenerator.hpp,
 // utility/curve_functions.hpp, oscillator/PolyBLEP.hpp.
 //
-//   HypersawUnit::run():
-//     double phase = (div_ * distributePhaseAmp_)
-//                  + (div_ * vibratoOut_)                 // always 0 -- see below
-//                  + (randomPhaseOffset_ * randomPhaseAmp_);
+//   HypersawUnit::run(), which has THREE variants stacked as comments --
+//   the file preserves an evolution of the formula, not just one line:
+//
+//     // vibratoOut_      = vibInput_ * vibAmp_ + vibOffset_;
+//     // double phase     = (div_ * distributePhaseAmp_) + (div_ * vibratoOut_) + (randomPhaseOffset_ *
+//     // randomPhaseAmp_); osc_.phaseOffset__ = phase + walkOut_;
+//
+//     double phase      = (div_ * distributePhaseAmp_) + (div_ * vibratoOut_) + (randomPhaseOffset_ * randomPhaseAmp_);
 //     osc_.phaseOffset_ = phase * ((vibInput_ * vibAmp_) + vibOffset_) + walkOut_;
-//     walkOut_ = driftAmp_ > 0 ? drift_.run() * driftAmp_ : 0;
+//
+//   The ACTIVE (uncommented) last line multiplies the whole static
+//   dispersion by (vibInput*vibAmp + vibOffset) -- which, with vibOffset
+//   at its Wire default of 0, silences distributePhaseAmp_/
+//   randomPhaseAmp_ entirely regardless of their own values. The two
+//   commented lines above show the walk getting there: originally
+//   `phase + walkOut_` (fully additive, every term independent), then an
+//   in-between step assigning `vibratoOut_` before folding it into
+//   `phase` too (`div_ * vibratoOut_`, still additive) -- only the LAST
+//   edit swapped `+` for `*`. This port uses the additive form (matching
+//   the first two variants): each dispersion source is independently
+//   controllable on its own, which is also the only way
+//   distributePhaseAmp/randomPhaseAmp work as plain, unconditional
+//   "phase position" controls rather than being gated by an unrelated
+//   vibrato setting.
 //
 // Transcribed here as (per voice i of numOscillators):
 //   div                = i / numOscillators
 //   randomPhaseOffset  = a fixed per-voice random value in [-1, 1] (matches
 //                        randomizePhase(): `bipolarNoiseGen_.runBipolar()`,
 //                        confirmed uniform on [-1,1] in NoiseGenerator.hpp)
-//   staticDispersion   = div * distributePhaseAmp + randomPhaseOffset * randomPhaseAmp
-//   vibratoMultiplier  = vibInputForVoice * vibAmp + vibOffset
+//   vibratoOut         = vibInputForVoice * vibAmp + vibOffset
 //   walkOut            = driftAmp > 0 ? drift * driftAmp : 0
-//   dispersion         = staticDispersion * vibratoMultiplier + walkOut
+//   dispersion         = div * distributePhaseAmp + div * vibratoOut
+//                       + randomPhaseOffset * randomPhaseAmp + walkOut
 //
 // Notes on fidelity:
-// - `vibratoOut_` is computed by a line that is commented out in the real
-//   HypersawUnit::run(), so it is always 0 in the original's actual
-//   (not intended) running behavior -- omitted here to match.
 // - `vibInput_` points at a single shared HypersawMaster::vibOsc_ for
 //   every voice from index 1 upward -- voice 0 never receives it.
 // - `vibOsc_` (a shared PolyBLEP oscillator) has no exposed rate control
@@ -256,13 +271,11 @@ extern "C" void soemdsp_hypersaw_reset(int handle) {
 //   factors into the high-rate white-noise crossfade (see file header).
 // driftJitter: Hz -- drives drift_'s fixed-step magnitude (jitter_), also
 //   factors into the same white-noise crossfade.
-// vibAmp: 0..2, how much the shared vibrato oscillator scales the static
-//   (distribute+random) dispersion (vibAmp_).
-// vibOffset: the constant term added alongside vibAmp*vibInput in that
-//   same scaling factor (vibOffset_) -- with vibAmp=0, this alone
-//   determines how much of the static dispersion passes through (1.0 =
-//   fully passes through, 0.0 = fully silences it, exactly per the
-//   original formula).
+// vibAmp: 0..2, how much the shared vibrato oscillator contributes to
+//   dispersion, scaled by div like distributePhaseAmp (vibAmp_).
+// vibOffset: a constant phase offset added alongside vibAmp*vibInput,
+//   also scaled by div (vibOffset_) -- an independent, always-additive
+//   term, not a gate on the other dispersion sources.
 // vibRate: Hz, the shared vibrato oscillator's rate (this port's own
 //   addition -- see file header comment).
 // level: output gain.
@@ -353,10 +366,9 @@ extern "C" void soemdsp_hypersaw_sample(
 
     // vibInput_ only ever points at vibOsc_ for i >= 1 (see file header).
     const double vibInputForVoice = (i == 0) ? 0.0 : vibSample;
+    const double vibratoOut = vibInputForVoice * vibAmt + vibOffsetAmt;
 
-    const double staticDispersion = div * distributeAmt + voice.randomOffset * randomAmt;
-    const double vibratoMultiplier = vibInputForVoice * vibAmt + vibOffsetAmt;
-    const double dispersion = staticDispersion * vibratoMultiplier + walkOut;
+    const double dispersion = div * distributeAmt + div * vibratoOut + voice.randomOffset * randomAmt + walkOut;
 
     const double renderPhase = wrap01(voice.phase + phaseOffset + dispersion);
     // PolyBLEP::saw(): 1 - 2*t + blep(t, dt) -- a descending ramp.
@@ -404,5 +416,5 @@ extern "C" int soemdsp_hypersaw_max_voices() {
 }
 
 extern "C" int soemdsp_hypersaw_version() {
-  return 5;
+  return 6;
 }

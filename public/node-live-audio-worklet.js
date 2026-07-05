@@ -6908,9 +6908,8 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
       }
 
       const vibInputForVoice = i === 0 ? 0 : vibSample;
-      const staticDispersion = div * distributeAmt + voice.randomOffset * randomAmt;
-      const vibratoMultiplier = vibInputForVoice * vibAmt + vibOffsetAmt;
-      const dispersion = staticDispersion * vibratoMultiplier + walkOut;
+      const vibratoOut = vibInputForVoice * vibAmt + vibOffsetAmt;
+      const dispersion = div * distributeAmt + div * vibratoOut + voice.randomOffset * randomAmt + walkOut;
 
       const renderPhase = this.hypersawWrap01(voice.phase + phaseOffset + dispersion);
       // PolyBLEP::saw(): 1 - 2*t + blep(t, dt) -- a descending ramp.
@@ -7904,7 +7903,7 @@ class NodeLiveAudioProcessor extends AudioWorkletProcessor {
           driftFrequency: read("driftFrequency", 2),
           driftJitter: read("driftJitter", 0.3),
           vibAmp: read("vibAmp", 0),
-          vibOffset: read("vibOffset", 1),
+          vibOffset: read("vibOffset", 0),
           vibRate: read("vibRate", 5),
           level: read("level", 0.35),
         });

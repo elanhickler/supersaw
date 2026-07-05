@@ -833,7 +833,7 @@ const nodeGraphModuleDefinitions = Object.freeze({
       { key: "driftFrequency", label: "Drift Frequency", kind: "frequency", defaultValue: "2", min: "0.01", mid: "2", max: "20", step: "any", unit: "Hz" },
       { key: "driftJitter", label: "Drift Jitter", kind: "frequency", defaultValue: "2", min: "0", mid: "2", max: "20", step: "any", unit: "Hz" },
       { key: "vibAmp", label: "Vib Amp", defaultValue: "0", min: "0", mid: "0.5", max: "2", step: "0.01" },
-      { key: "vibOffset", label: "Vib Offset", defaultValue: "1", min: "0", mid: "1", max: "2", step: "0.01" },
+      { key: "vibOffset", label: "Vib Offset", defaultValue: "0", min: "-1", mid: "0", max: "1", step: "0.01" },
       { key: "vibRate", label: "Vib Rate", kind: "frequency", defaultValue: "5", min: "0.01", mid: "5", max: "20", step: "any", unit: "Hz" },
       { key: "level", label: "Amplitude", defaultValue: "0.35", min: "0", mid: "0.5", max: "1", step: "0.01" },
     ],

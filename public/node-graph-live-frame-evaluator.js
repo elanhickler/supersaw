@@ -3065,7 +3065,7 @@ function evaluateNodeGraphPlanFrame(runtime, sampleRate, frame, frames) {
         driftFrequency: read("driftFrequency", 2),
         driftJitter: read("driftJitter", 0.3),
         vibAmp: read("vibAmp", 0),
-        vibOffset: read("vibOffset", 1),
+        vibOffset: read("vibOffset", 0),
         vibRate: read("vibRate", 5),
         level: read("level", 0.35),
       });
